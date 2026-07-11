@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% block title %}拍照识别 - 物流协同站{% endblock %}
+{% block content %}
+<section class="panel rise-in">
+  <h2>拍照识别取件</h2>
+  <p class="muted">上传手机拍的快递面单图片，系统会用 OCR + 一维码扫描提取订单号，并匹配提醒尾号；命中后给组内所有成员发送通知。</p>
+  <form method="post" enctype="multipart/form-data" class="form-grid">
+    <label>
+      上传图片
+      <input type="file" name="pickup_image" accept="image/*" capture="environment" required>
+    </label>
+    <button type="submit" class="btn-primary">识别并发送通知</button>
+  </form>
+</section>
+
+{% if scan_result %}
+<section class="panel rise-in result-panel">
+  <h3>识别结果</h3>
+  <div class="result-highlight">
+    <p>本次显示组别</p>
+    <h4>{{ scan_result.shown_group }}</h4>
+    <small>若多个组命中同一快递，系统会随机显示其中一个组。</small>
+  </div>
+
+  <div class="result-grid">
+    <article>
+      <h5>条码识别</h5>
+      {% if scan_result.barcode_values %}
+        <ul>
+          {% for item in scan_result.barcode_values %}<li>{{ item }}</li>{% endfor %}
+        </ul>
+      {% else %}
+        <p class="muted">未识别到条码文本</p>
+      {% endif %}
+    </article>
+
+    <article>
+      <h5>OCR 文本</h5>
+      {% if scan_result.ocr_lines %}
+        <ul>
+          {% for item in scan_result.ocr_lines %}<li>{{ item }}</li>{% endfor %}
+        </ul>
+      {% else %}
+        <p class="muted">未识别到 OCR 文本</p>
+      {% endif %}
+    </article>
+
+    <article>
+      <h5>候选订单号</h5>
+      {% if scan_result.candidates %}
+        <ul>
+          {% for item in scan_result.candidates %}<li>{{ item }}</li>{% endfor %}
+        </ul>
+      {% else %}
+        <p class="muted">未提取到候选订单号</p>
+      {% endif %}
+    </article>
+  </div>
+
+  <div class="summary-band">
+    <p>本次写入通知数量：<strong>{{ scan_result.notifications_created }}</strong></p>
+  </div>
+
+  {% if scan_result.match_rows %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>命中组</th>
+          <th>提醒尾号</th>
+          <th>识别单号</th>
+          <th>通知文案</th>
+          <th>组成员数</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in scan_result.match_rows %}
+          <tr>
+            <td>{{ row.group_name }}</td>
+            <td>{{ row.suffix }}</td>
+            <td>{{ row.candidate }}</td>
+            <td>{{ row.message }}</td>
+            <td>{{ row.member_count }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="muted">没有匹配到任何提醒规则，因此没有生成通知。</p>
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}

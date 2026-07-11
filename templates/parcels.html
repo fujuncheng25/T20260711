@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}物流总表 - 物流协同站{% endblock %}
+{% block content %}
+<section class="panel rise-in">
+  <div class="section-head">
+    <div>
+      <h2>物流总表</h2>
+      <p class="muted">查看快递当前信息，并显示该快递可能归属的目标组。</p>
+    </div>
+    <form method="get" class="form-inline">
+      <input type="text" name="q" value="{{ keyword }}" placeholder="搜索订单号 / 快递号 / 物品">
+      <button type="submit" class="btn-secondary">搜索</button>
+    </form>
+  </div>
+
+  {% if parcels %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>类型</th>
+          <th>物品简述</th>
+          <th>数量</th>
+          <th>购买时间</th>
+          <th>购买状态</th>
+          <th>购买人</th>
+          <th>金额</th>
+          <th>支付凭证+物流状态</th>
+          <th>到达时间</th>
+          <th>订单号</th>
+          <th>快递单号</th>
+          <th>报销状态</th>
+          <th>目标组</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in parcels %}
+          <tr>
+            <td>{{ row.category }}</td>
+            <td>{{ row.item_desc }}</td>
+            <td>{{ row.quantity or '' }}</td>
+            <td>{{ row.purchase_time }}</td>
+            <td>{{ row.purchase_status }}</td>
+            <td>{{ row.purchaser }}</td>
+            <td>{{ row.amount }}</td>
+            <td>{{ row.payment_and_logistics_status }}</td>
+            <td>{{ row.arrival_time }}</td>
+            <td>{{ row.order_no }}</td>
+            <td>{{ row.tracking_no }}</td>
+            <td>{{ row.reimbursement_status }}</td>
+            <td><span class="chip strong">{{ destination_by_parcel[row.id] }}</span></td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="muted">没有数据，请先回到控制台导入物流表。</p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}通知中心 - 物流协同站{% endblock %}
+{% block content %}
+<section class="panel rise-in">
+  <div class="section-head">
+    <div>
+      <h2>通知中心</h2>
+      <p class="muted">当有人拍照拿到命中尾号的快递时，组成员会在这里收到通知。</p>
+    </div>
+    <form method="post" action="{{ url_for('read_all_notifications') }}">
+      <button type="submit" class="btn-secondary">全部标记已读</button>
+    </form>
+  </div>
+
+  {% if notifications %}
+    <ul class="note-list">
+      {% for note in notifications %}
+        <li class="note-item {% if not note.is_read %}unread{% endif %}">
+          <strong>{{ note.title }}</strong>
+          <p>{{ note.body }}</p>
+          <small>{{ note.created_at.strftime('%Y-%m-%d %H:%M:%S') }} · {% if note.is_read %}已读{% else %}未读{% endif %}</small>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="muted">当前没有通知。</p>
+  {% endif %}
+</section>
+{% endblock %}

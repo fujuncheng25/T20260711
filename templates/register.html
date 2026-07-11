@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}注册 - 物流协同站{% endblock %}
+{% block content %}
+<section class="auth-wrap rise-in">
+  <article class="panel auth-panel">
+    <h2>创建账号</h2>
+    <p class="muted">注册后可加入或创建用户组，设置订单尾号提醒。</p>
+    <form method="post" class="form-grid">
+      <label>
+        用户名
+        <input type="text" name="username" minlength="3" required autocomplete="username">
+      </label>
+      <label>
+        密码
+        <input type="password" name="password" minlength="6" required autocomplete="new-password">
+      </label>
+      <label>
+        再输入一次密码
+        <input type="password" name="password_confirm" minlength="6" required autocomplete="new-password">
+      </label>
+      <button type="submit" class="btn-primary">注册并开始使用</button>
+    </form>
+    <p class="switch-link">已经有账号？<a href="{{ url_for('login') }}">去登录</a></p>
+  </article>
+</section>
+{% endblock %}

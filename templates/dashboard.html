@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block title %}控制台 - 物流协同站{% endblock %}
+{% block content %}
+<section class="hero panel rise-in">
+  <div>
+    <p class="hero-tag">协同中心</p>
+    <h2>欢迎，{{ current_user.username }}</h2>
+    <p class="muted">导入物流表后，按用户组设置订单尾号提醒；有人拍照拿件时，系统会通知该组全部成员。</p>
+  </div>
+  <div class="stats-grid">
+    <article class="stat-card">
+      <p>物流记录</p>
+      <h3>{{ parcel_count }}</h3>
+    </article>
+    <article class="stat-card">
+      <p>活跃提醒</p>
+      <h3>{{ active_reminders }}</h3>
+    </article>
+    <article class="stat-card">
+      <p>未读通知</p>
+      <h3>{{ unread_count }}</h3>
+    </article>
+  </div>
+</section>
+
+<section class="layout-two">
+  <article class="panel rise-in">
+    <h3>导入物流表到 PostgreSQL</h3>
+    <p class="muted">支持 CSV / XLSX。核心列建议使用：类型、物品简述、数量、购买时间、购买状态、购买人、金额、支付凭证+物流状态、到达时间、订单号、快递单号、报销状态。</p>
+    <form method="post" action="{{ url_for('import_logistics') }}" enctype="multipart/form-data" class="form-grid">
+      <label>
+        选择表格文件
+        <input type="file" name="sheet_file" accept=".csv,.xlsx,.xls" required>
+      </label>
+      <button type="submit" class="btn-primary">开始导入</button>
+    </form>
+  </article>
+
+  <article class="panel rise-in">
+    <h3>创建用户组</h3>
+    <p class="muted">例如 B组、C组。组内成员可共享同一批提醒通知。</p>
+    <form method="post" action="{{ url_for('create_group') }}" class="form-inline">
+      <input type="text" name="group_name" placeholder="输入组名，例如 B组" required>
+      <button type="submit" class="btn-primary">新建组</button>
+    </form>
+    <a href="{{ url_for('scan') }}" class="btn-ghost">去拍照识别快递</a>
+  </article>
+</section>
+
+<section class="panel rise-in">
+  <h3>我的用户组与提醒</h3>
+  {% if groups %}
+    <div class="group-grid">
+      {% for group in groups %}
+        <article class="group-card" style="--delay: {{ loop.index0 * 90 }}ms;">
+          <header>
+            <h4>{{ group.name }}</h4>
+            <p class="muted">成员 {{ group.members|length }} 人，提醒 {{ group.reminders|length }} 条</p>
+          </header>
+
+          <div class="chip-wrap">
+            {% for member in group.members|sort(attribute='created_at') %}
+              <span class="chip">{{ member.user.username }}{% if member.role == 'owner' %}（组主）{% endif %}</span>
+            {% endfor %}
+          </div>
+
+          <form method="post" action="{{ url_for('add_group_member', group_id=group.id) }}" class="form-inline compact">
+            <input type="text" name="username" placeholder="输入已注册用户名" required>
+            <button type="submit" class="btn-secondary">添加成员</button>
+          </form>
+
+          <div class="reminder-list">
+            {% if group.reminders %}
+              {% for reminder in group.reminders|sort(attribute='created_at', reverse=true) %}
+                <article class="reminder-row {% if not reminder.is_active %}is-off{% endif %}">
+                  <div>
+                    <p>尾号 {{ reminder.order_suffix }} · {{ reminder.custom_message }}</p>
+                    <small>{{ reminder.created_at.strftime('%Y-%m-%d %H:%M') }} · {% if reminder.is_active %}启用中{% else %}已停用{% endif %}</small>
+                  </div>
+                  <form method="post" action="{{ url_for('toggle_reminder', reminder_id=reminder.id) }}">
+                    <button type="submit" class="btn-ghost small">{% if reminder.is_active %}停用{% else %}启用{% endif %}</button>
+                  </form>
+                </article>
+              {% endfor %}
+            {% else %}
+              <p class="muted">还没有提醒，先创建一条尾号规则。</p>
+            {% endif %}
+          </div>
+
+          <form method="post" action="{{ url_for('create_reminder', group_id=group.id) }}" class="form-grid compact">
+            <label>
+              订单尾号（至少4位）
+              <input type="text" name="order_suffix" placeholder="例如 3829 或 20243829" required>
+            </label>
+            <label>
+              通知文案
+              <input type="text" name="custom_message" value="{{ default_notify_message }}" maxlength="240">
+            </label>
+            <button type="submit" class="btn-primary">保存提醒</button>
+          </form>
+        </article>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="muted">还没有用户组，先创建一个。</p>
+  {% endif %}
+</section>
+
+<section class="panel rise-in">
+  <h3>最近通知</h3>
+  {% if recent_notifications %}
+    <ul class="note-list">
+      {% for note in recent_notifications %}
+        <li class="note-item {% if not note.is_read %}unread{% endif %}">
+          <strong>{{ note.title }}</strong>
+          <p>{{ note.body }}</p>
+          <small>{{ note.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</small>
+        </li>
+      {% endfor %}
+    </ul>
+    <a class="btn-ghost" href="{{ url_for('notifications') }}">查看全部通知</a>
+  {% else %}
+    <p class="muted">暂无通知。</p>
+  {% endif %}
+</section>
+{% endblock %}

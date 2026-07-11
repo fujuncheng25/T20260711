@@ -1,757 +1,893 @@
 from __future__ import annotations
 
-import ctypes
-import io
+import datetime as dt
+import os
+import random
 import re
-import secrets
-import threading
-import time
-from dataclasses import dataclass
-from typing import Callable, Optional
+import uuid
+from functools import wraps
+from pathlib import Path
+from typing import Iterable
 
+import numpy as np
 import pandas as pd
-import pyautogui
-import pygetwindow as gw
-import pyperclip
-from flask import Flask, abort, redirect, render_template_string, request, send_file, url_for
+from flask import Flask, flash, g, redirect, render_template, request, session, url_for
+from PIL import Image, ImageOps
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    desc,
+    func,
+    or_,
+    select,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, scoped_session, sessionmaker
+from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.utils import secure_filename
 
-BASE_URL = (
-    "https://trade.tmall.com/detail/orderDetail.htm"
-    "?spm=tbpc.boughtlist.order_detail.1.6c622e8dEevWzv"
-    "&bizOrderId={order_id}"
+APP_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = APP_DIR / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+UI_BUILD_ID = "20260711_200500_94731"
+UI_CSS_FILE = f"ui_{UI_BUILD_ID}.css"
+UI_JS_FILE = f"ui_{UI_BUILD_ID}.js"
+
+DEFAULT_NOTIFY_MESSAGE = "您的快递到了"
+EMPTY_VALUES = {"", "NAN", "NONE", "NULL", "/", "\\", "-"}
+ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+ORDER_TOKEN_PATTERN = re.compile(r"[A-Z0-9]{8,32}")
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+psycopg2://postgres:postgres@127.0.0.1:5432/logistics_alert",
 )
 
-EMPTY_LIKE = {"", "nan", "none", "null", "/", "\\", "-"}
-TRACKING_PATTERN = re.compile(
-    r"\b(?:SF|YT|JT|JDAP|DPK|LP|ZTO|STO|EMS|YUNDA|JD|DBK)?[A-Z0-9]{10,24}\b",
-    re.IGNORECASE,
-)
-PAYMENT_DATETIME_PATTERN = re.compile(
-    r"(20\d{2}[年\-./\s]\d{1,2}[月\-./\s]\d{1,2}(?:日)?\s*\d{1,2}:\d{2}(?::\d{2})?)"
-)
-ARRIVAL_PATTERN = re.compile(
-    r"(?:预计|已于)?\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}[^\n]{0,16}(?:送达|签收)?"
-    r"|(?:\d{1,2}[/-]\d{1,2}[^\n]{0,16}(?:送达|签收))"
-)
-COURIER_PREFIX_PATTERN = re.compile(
-    r"^(?:SF|YT|JT|JDAP|DPK|LP|ZTO|STO|EMS|YUNDA|JD|DBK)", re.IGNORECASE
-)
-DEFAULT_PAGE_WAIT_SECONDS = 20.0
-DEFAULT_ORDER_INTERVAL_SECONDS = 20.0
-MIN_PAGE_WAIT_SECONDS = 0.5
-MIN_ORDER_INTERVAL_SECONDS = 10.0
-
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
-RESULT_STORE: dict[str, dict[str, object]] = {}
-FIREFOX_LOCK = threading.Lock()
+LOGISTICS_COLUMN_ALIASES = {
+    "category": ("类型",),
+    "item_desc": ("物品简述", "物品描述"),
+    "quantity": ("数量",),
+    "purchase_time": ("购买时间",),
+    "purchase_status": ("购买状态",),
+    "purchaser": ("购买人",),
+    "amount": ("金额",),
+    "payment_and_logistics_status": ("支付凭证+物流状态", "支付凭证物流状态"),
+    "arrival_time": ("到达时间",),
+    "order_no": ("订单号", "订单编号", "订单ID"),
+    "tracking_no": ("快递单号", "物流单号"),
+    "reimbursement_status": ("报销状态",),
+}
 
 
-@dataclass
-class OrderInfo:
-    item_name: str = ""
-    tracking_no: str = ""
-    arrival_time: str = ""
-    payment_time: str = ""
+class Base(DeclarativeBase):
+    pass
 
 
-class FirefoxAccessLimitedError(RuntimeError):
-    """Raised when Firefox shows an access-control or rate-limit page."""
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    username: Mapped[str] = mapped_column(String(60), unique=True, nullable=False, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, nullable=False)
+
+    memberships: Mapped[list["GroupMember"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+    created_groups: Mapped[list["UserGroup"]] = relationship(back_populates="owner")
+    created_reminders: Mapped[list["Reminder"]] = relationship(back_populates="creator")
+    notifications: Mapped[list["Notification"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
 
 
-def is_empty_value(value: object) -> bool:
+class UserGroup(Base):
+    __tablename__ = "user_groups"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, nullable=False)
+
+    owner: Mapped[User] = relationship(back_populates="created_groups")
+    members: Mapped[list["GroupMember"]] = relationship(
+        back_populates="group",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+    reminders: Mapped[list["Reminder"]] = relationship(
+        back_populates="group",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
+
+class GroupMember(Base):
+    __tablename__ = "group_members"
+    __table_args__ = (UniqueConstraint("group_id", "user_id", name="uq_group_member"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    group_id: Mapped[int] = mapped_column(ForeignKey("user_groups.id"), nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    role: Mapped[str] = mapped_column(String(20), default="member", nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, nullable=False)
+
+    group: Mapped[UserGroup] = relationship(back_populates="members")
+    user: Mapped[User] = relationship(back_populates="memberships")
+
+
+class Reminder(Base):
+    __tablename__ = "reminders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    group_id: Mapped[int] = mapped_column(ForeignKey("user_groups.id"), nullable=False, index=True)
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    order_suffix: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    custom_message: Mapped[str] = mapped_column(String(240), default=DEFAULT_NOTIFY_MESSAGE, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, nullable=False)
+
+    group: Mapped[UserGroup] = relationship(back_populates="reminders")
+    creator: Mapped[User] = relationship(back_populates="created_reminders")
+
+
+class Parcel(Base):
+    __tablename__ = "parcels"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    category: Mapped[str] = mapped_column(String(50), default="", nullable=False)
+    item_desc: Mapped[str] = mapped_column(String(300), default="", nullable=False)
+    quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    purchase_time: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    purchase_status: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    purchaser: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    amount: Mapped[str] = mapped_column(String(40), default="", nullable=False)
+    payment_and_logistics_status: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    arrival_time: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    order_no: Mapped[str] = mapped_column(String(80), unique=True, nullable=False, index=True)
+    tracking_no: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    reimbursement_status: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, nullable=False)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime,
+        default=dt.datetime.utcnow,
+        onupdate=dt.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class PickupEvent(Base):
+    __tablename__ = "pickup_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    scanner_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    image_path: Mapped[str] = mapped_column(String(260), nullable=False)
+    extracted_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    detected_order_no: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    shown_group_id: Mapped[int | None] = mapped_column(ForeignKey("user_groups.id"), nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, nullable=False)
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    group_id: Mapped[int] = mapped_column(ForeignKey("user_groups.id"), nullable=False, index=True)
+    reminder_id: Mapped[int] = mapped_column(ForeignKey("reminders.id"), nullable=False, index=True)
+    pickup_event_id: Mapped[int] = mapped_column(ForeignKey("pickup_events.id"), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(120), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, nullable=False)
+
+    user: Mapped[User] = relationship(back_populates="notifications")
+
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+SessionFactory = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+SessionLocal = scoped_session(SessionFactory)
+
+app = Flask(__name__, template_folder="templates", static_folder="static")
+app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "change-me-before-production")
+app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
+
+
+def init_db() -> None:
+    Base.metadata.create_all(engine)
+
+
+def clean_text(value: object) -> str:
     if value is None:
-        return True
-    if isinstance(value, float) and pd.isna(value):
-        return True
-    value_text = str(value).strip()
-    return not value_text or value_text.lower() in EMPTY_LIKE
+        return ""
+    text = str(value).strip()
+    if text.upper() in EMPTY_VALUES:
+        return ""
+    return text
 
 
-def clean_text_lines(text: str) -> list[str]:
-    lines: list[str] = []
-    for line in text.splitlines():
-        line = re.sub(r"\s+", " ", line).strip()
-        if line:
-            lines.append(line)
-    return lines
+def normalize_token(value: object) -> str:
+    return re.sub(r"[^A-Z0-9]", "", clean_text(value).upper())
 
 
-def extract_tracking_no(lines: list[str], page_text: str) -> str:
-    logistics_terms = ("运单", "物流", "快递", "包裹", "顺丰", "圆通", "中通", "京东", "邮政", "韵达")
+def parse_quantity(value: object) -> int | None:
+    text = clean_text(value)
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
 
-    for line in lines:
-        if not any(term in line for term in logistics_terms):
-            continue
-        candidates = TRACKING_PATTERN.findall(line.replace(" ", ""))
-        for candidate in candidates:
-            if COURIER_PREFIX_PATTERN.match(candidate):
-                return candidate
-        for candidate in candidates:
-            if 10 <= len(candidate) <= 16 and not candidate.isalpha():
-                return candidate
 
-    candidates = TRACKING_PATTERN.findall(page_text.replace(" ", ""))
-    for candidate in candidates:
-        if COURIER_PREFIX_PATTERN.match(candidate):
-            return candidate
-    for candidate in candidates:
-        # Tmall order IDs are commonly 19 digits; avoid using those as a tracking number.
-        if 10 <= len(candidate) <= 16 and not candidate.isalpha():
-            return candidate
+def pick_first_value(row: pd.Series, aliases: Iterable[str]) -> str:
+    for alias in aliases:
+        if alias in row.index:
+            value = clean_text(row.get(alias, ""))
+            if value:
+                return value
     return ""
 
 
-def extract_payment_time(lines: list[str]) -> str:
-    for index, line in enumerate(lines):
-        if "付款时间" not in line and "支付时间" not in line:
+def load_table_from_upload(uploaded_file) -> pd.DataFrame:
+    filename = (uploaded_file.filename or "").lower()
+    if filename.endswith(".csv"):
+        return pd.read_csv(uploaded_file, dtype=str, keep_default_na=False)
+    if filename.endswith(".xlsx") or filename.endswith(".xls"):
+        return pd.read_excel(uploaded_file, dtype=str, keep_default_na=False)
+    raise ValueError("只支持 CSV/XLS/XLSX 文件。")
+
+
+def load_table_from_path(path: Path) -> pd.DataFrame:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return pd.read_csv(path, dtype=str, keep_default_na=False)
+    if suffix in {".xlsx", ".xls"}:
+        return pd.read_excel(path, dtype=str, keep_default_na=False)
+    raise ValueError("输入文件必须是 CSV/XLS/XLSX。")
+
+
+def import_parcel_dataframe(db_session, df: pd.DataFrame) -> tuple[int, int, int]:
+    parsed_rows: list[dict[str, object]] = []
+    skipped = 0
+
+    for _, row in df.iterrows():
+        order_no = normalize_token(pick_first_value(row, LOGISTICS_COLUMN_ALIASES["order_no"]))
+        if not order_no:
+            skipped += 1
             continue
 
-        for candidate_line in lines[index : index + 3]:
-            matched = PAYMENT_DATETIME_PATTERN.search(candidate_line)
-            if matched:
-                return re.sub(r"\s+", " ", matched.group(1)).strip()
-    return ""
-
-
-def extract_arrival_time(lines: list[str], page_text: str) -> str:
-    for line in lines:
-        if not any(term in line for term in ("送达", "签收", "预计")):
-            continue
-        matched = ARRIVAL_PATTERN.search(line)
-        if matched:
-            return matched.group(0).strip()
-        return line
-
-    matched = ARRIVAL_PATTERN.search(page_text)
-    return matched.group(0).strip() if matched else ""
-
-
-def extract_item_name(lines: list[str], tracking_no: str) -> str:
-    """Find a likely item title in copied, rendered order-page text."""
-    ignored_terms = (
-        "订单详情",
-        "订单信息",
-        "付款详情",
-        "查看物流",
-        "确认收货",
-        "加入购物车",
-        "退款",
-        "付款",
-        "卖家已",
-        "物流服务",
-        "订单号",
-        "交易号",
-        "支付方式",
-        "收货地址",
-        "订单服务",
-        "猜你喜欢",
-        "累计",
-        "实付款",
-        "商品总价",
-        "运费",
-        "展开全部商品",
-        "申请售后",
-    )
-
-    tracking_index = -1
-    if tracking_no:
-        for index, line in enumerate(lines):
-            if tracking_no in line:
-                tracking_index = index
-                break
-
-    if tracking_index >= 0:
-        # Product titles are normally displayed directly beneath the package/logistics line.
-        search_lines = lines[tracking_index + 1 : tracking_index + 25] + lines[:tracking_index]
-    else:
-        search_lines = lines
-
-    candidates: list[tuple[int, str]] = []
-    for line in search_lines:
-        if len(line) < 3 or len(line) > 180:
-            continue
-        if any(term in line for term in ignored_terms):
-            continue
-        if re.search(r"(?:¥|￥|订单号|交易号|x\d+\b)", line, re.IGNORECASE):
-            continue
-        if re.fullmatch(r"[\d\s.,:：/-]+", line):
-            continue
-
-        score = 0
-        if re.search(r"[\u4e00-\u9fff]", line):
-            score += 4
-        if re.search(r"\d", line):
-            score += 2
-        if re.search(r"(?:M\d|\*|×|X\d|[【\[（(].+[】\]）)])", line, re.IGNORECASE):
-            score += 2
-        if tracking_index >= 0 and line in lines[tracking_index + 1 : tracking_index + 12]:
-            score += 2
-        if 4 <= len(line) <= 100:
-            score += 1
-        if score >= 4:
-            candidates.append((score, line))
-
-    return max(candidates, default=(0, ""), key=lambda item: item[0])[1]
-
-
-def _find_firefox_window():
-    """Return the active Firefox window, otherwise the largest visible Firefox window."""
-    try:
-        active = gw.getActiveWindow()
-        if active and "firefox" in (active.title or "").lower():
-            return active
-
-        candidates = [
-            window
-            for window in gw.getAllWindows()
-            if "firefox" in (window.title or "").lower()
-            and window.width > 300
-            and window.height > 200
-        ]
-    except Exception as exc:
-        raise RuntimeError(f"无法读取 Windows 窗口列表: {exc}") from exc
-
-    if not candidates:
-        raise RuntimeError("未找到已打开的 Firefox 窗口。请先打开并登录天猫后再开始补全。")
-    return max(candidates, key=lambda window: window.width * window.height)
-
-
-def _window_handle(window) -> int:
-    try:
-        return int(getattr(window, "_hWnd", 0) or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _foreground_window_handle() -> int:
-    try:
-        return int(ctypes.windll.user32.GetForegroundWindow())
-    except (AttributeError, OSError):
-        return 0
-
-
-class ExistingFirefoxScraper:
-    """Controls an existing visible Firefox window; it never launches a browser process."""
-
-    def __init__(
-        self,
-        page_wait_seconds: float,
-        status_cb: Optional[Callable[[str, str], None]] = None,
-    ) -> None:
-        self._page_wait_seconds = page_wait_seconds
-        self._status_cb = status_cb
-        self._firefox_window = _find_firefox_window()
-        self._firefox_handle = _window_handle(self._firefox_window)
-        self._previous_window = None
-        self._previous_clipboard = ""
-        self._temporary_tab_opened = False
-
-    def _report(self, level: str, message: str) -> None:
-        if self._status_cb:
-            self._status_cb(level, message)
-
-    def _activate_firefox(self) -> None:
-        try:
-            if getattr(self._firefox_window, "isMinimized", False):
-                self._firefox_window.restore()
-            if self._firefox_handle:
-                user32 = ctypes.windll.user32
-                user32.BringWindowToTop(self._firefox_handle)
-                user32.SetForegroundWindow(self._firefox_handle)
-            self._firefox_window.activate()
-        except Exception as exc:
-            raise RuntimeError(f"无法激活现有 Firefox 窗口: {exc}") from exc
-        time.sleep(0.8)
-
-        active_window = gw.getActiveWindow()
-        active_handle = _foreground_window_handle()
-        is_expected_handle = bool(self._firefox_handle and active_handle == self._firefox_handle)
-        is_firefox_title = bool(
-            active_window and "firefox" in (active_window.title or "").lower()
+        parsed_rows.append(
+            {
+                "category": pick_first_value(row, LOGISTICS_COLUMN_ALIASES["category"]),
+                "item_desc": pick_first_value(row, LOGISTICS_COLUMN_ALIASES["item_desc"]),
+                "quantity": parse_quantity(pick_first_value(row, LOGISTICS_COLUMN_ALIASES["quantity"])),
+                "purchase_time": pick_first_value(row, LOGISTICS_COLUMN_ALIASES["purchase_time"]),
+                "purchase_status": pick_first_value(row, LOGISTICS_COLUMN_ALIASES["purchase_status"]),
+                "purchaser": pick_first_value(row, LOGISTICS_COLUMN_ALIASES["purchaser"]),
+                "amount": pick_first_value(row, LOGISTICS_COLUMN_ALIASES["amount"]),
+                "payment_and_logistics_status": pick_first_value(
+                    row,
+                    LOGISTICS_COLUMN_ALIASES["payment_and_logistics_status"],
+                ),
+                "arrival_time": pick_first_value(row, LOGISTICS_COLUMN_ALIASES["arrival_time"]),
+                "order_no": order_no,
+                "tracking_no": normalize_token(pick_first_value(row, LOGISTICS_COLUMN_ALIASES["tracking_no"])),
+                "reimbursement_status": pick_first_value(row, LOGISTICS_COLUMN_ALIASES["reimbursement_status"]),
+            }
         )
-        is_foreground = is_expected_handle if self._firefox_handle else is_firefox_title
-        if not is_foreground:
-            raise RuntimeError(
-                "Firefox 未成为前台窗口。为避免快捷键发到其他程序，本次不会打开或读取订单；"
-                "请将 Firefox 放到最前面后重试。"
-            )
 
-    def __enter__(self) -> "ExistingFirefoxScraper":
-        try:
-            self._previous_window = gw.getActiveWindow()
-        except Exception:
-            self._previous_window = None
+    if not parsed_rows:
+        return 0, 0, skipped
 
-        try:
-            self._previous_clipboard = pyperclip.paste()
-        except Exception:
-            self._previous_clipboard = ""
+    order_nos = [item["order_no"] for item in parsed_rows]
+    existing = db_session.scalars(select(Parcel).where(Parcel.order_no.in_(order_nos))).all()
+    existing_by_order = {item.order_no: item for item in existing}
 
-        self._activate_firefox()
-        pyautogui.hotkey("ctrl", "t")
-        time.sleep(0.8)
-        self._temporary_tab_opened = True
-        self._report(
-            "info",
-            "已确认当前有头 Firefox 在前台，并已在同一窗口请求新建临时标签页；不点击页面元素。",
-        )
-        return self
+    inserted = 0
+    updated = 0
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
-        try:
-            if self._temporary_tab_opened:
-                try:
-                    self._activate_firefox()
-                except RuntimeError:
-                    self._report("warning", "Firefox 未在前台，临时标签页未自动关闭。")
-                else:
-                    pyautogui.hotkey("ctrl", "w")
-                    time.sleep(0.35)
-        finally:
-            try:
-                pyperclip.copy(self._previous_clipboard)
-            except Exception:
-                pass
-            try:
-                if self._previous_window and self._previous_window != self._firefox_window:
-                    self._previous_window.activate()
-            except Exception:
-                pass
+    for payload in parsed_rows:
+        order_no = str(payload["order_no"])
+        current = existing_by_order.get(order_no)
+        if current is None:
+            db_session.add(Parcel(**payload))
+            inserted += 1
+            continue
 
-    def _copy_rendered_page_text(self) -> str:
-        self._activate_firefox()
-        clipboard_marker = "__TMALL_CSV_COPY_PENDING__"
-        try:
-            pyperclip.copy(clipboard_marker)
-        except Exception:
-            clipboard_marker = ""
-        pyautogui.hotkey("ctrl", "a")
-        time.sleep(0.2)
-        pyautogui.hotkey("ctrl", "c")
-        time.sleep(0.6)
-        try:
-            page_text = str(pyperclip.paste()).strip()
-        except Exception as exc:
-            raise RuntimeError(f"无法从 Firefox 复制已渲染页面内容: {exc}") from exc
+        for field_name, field_value in payload.items():
+            setattr(current, field_name, field_value)
+        updated += 1
 
-        if clipboard_marker and page_text == clipboard_marker:
-            raise RuntimeError("Firefox 未复制到页面正文；请确认浏览器窗口未被遮挡且未最小化。")
-        return page_text
-
-    @staticmethod
-    def _is_order_detail_page(text: str) -> bool:
-        return any(marker in text for marker in ("订单详情", "订单信息", "付款详情", "订单服务"))
-
-    @staticmethod
-    def _is_login_or_blocked_page(text: str) -> bool:
-        markers = ("请登录", "扫码登录", "密码登录", "访问受限", "操作频繁", "系统繁忙")
-        return any(marker in text for marker in markers)
-
-    def get_order_page_text(self, order_id: str) -> str:
-        url = BASE_URL.format(order_id=order_id)
-        self._activate_firefox()
-        pyautogui.hotkey("ctrl", "l")
-        time.sleep(0.2)
-        pyautogui.write(url, interval=0.01)
-        pyautogui.press("enter")
-
-        self._report(
-            "info",
-            f"订单 {order_id} 已打开；固定等待 {self._page_wait_seconds:g} 秒让页面自然加载，不点击订单页内容。",
-        )
-        time.sleep(self._page_wait_seconds)
-        page_text = self._copy_rendered_page_text()
-
-        if self._is_login_or_blocked_page(page_text):
-            if any(marker in page_text for marker in ("访问受限", "操作频繁", "系统繁忙")):
-                raise FirefoxAccessLimitedError(
-                    "Firefox 显示访问受限或操作频繁提示，已停止后续订单，避免继续发起请求。"
-                )
-            raise RuntimeError("当前 Firefox 未保持天猫登录态；请先在该 Firefox 中完成登录后重试。")
-        if not self._is_order_detail_page(page_text):
-            raise RuntimeError("未读到订单详情页正文；本订单不会重试。")
-        return page_text
+    return inserted, updated, skipped
 
 
-def scrape_order_detail(order_id: str, firefox: ExistingFirefoxScraper) -> OrderInfo:
-    page_text = firefox.get_order_page_text(order_id)
-    lines = clean_text_lines(page_text)
-    tracking_no = extract_tracking_no(lines, page_text)
-    return OrderInfo(
-        item_name=extract_item_name(lines, tracking_no),
-        tracking_no=tracking_no,
-        arrival_time=extract_arrival_time(lines, page_text),
-        payment_time=extract_payment_time(lines),
-    )
+def decode_barcodes(image: np.ndarray) -> list[str]:
+    try:
+        import zxingcpp
+    except Exception:
+        return []
+
+    values: list[str] = []
+    try:
+        results = zxingcpp.read_barcodes(image)
+    except Exception:
+        return []
+
+    for result in results:
+        text = clean_text(getattr(result, "text", ""))
+        if text:
+            values.append(text)
+    return list(dict.fromkeys(values))
 
 
-def fill_csv(
-    df: pd.DataFrame,
-    order_col: str,
-    item_col: str,
-    tracking_col: str,
-    arrival_col: str,
-    purchase_time_col: str,
-    page_wait_seconds: float = DEFAULT_PAGE_WAIT_SECONDS,
-    order_interval_seconds: float = DEFAULT_ORDER_INTERVAL_SECONDS,
-    status_cb: Optional[Callable[[str, str], None]] = None,
-    progress_cb: Optional[Callable[[int, int], None]] = None,
-) -> pd.DataFrame:
-    """Fill only blank supported cells by operating the already-open Firefox GUI."""
-    df_out = df.copy()
+def decode_ocr_lines(image: Image.Image) -> list[str]:
+    try:
+        import pytesseract
+    except Exception:
+        return []
 
-    def report(level: str, message: str) -> None:
-        if status_cb:
-            status_cb(level, message)
-
-    def report_progress(done: int, total: int) -> None:
-        if progress_cb:
-            progress_cb(done, total)
-
-    if order_col not in df_out.columns:
-        raise ValueError(f"CSV 中找不到订单列: {order_col}")
-    if page_wait_seconds < MIN_PAGE_WAIT_SECONDS:
-        raise ValueError(f"页面加载等待时间不能少于 {MIN_PAGE_WAIT_SECONDS:g} 秒。")
-    if order_interval_seconds < MIN_ORDER_INTERVAL_SECONDS:
-        raise ValueError(f"订单间隔不能少于 {MIN_ORDER_INTERVAL_SECONDS:g} 秒。")
-
-    target_columns = [
-        column
-        for column in (item_col, tracking_col, arrival_col, purchase_time_col)
-        if column in df_out.columns
+    # Use grayscale + autocontrast to increase OCR robustness for courier labels.
+    prepared = ImageOps.autocontrast(ImageOps.grayscale(image))
+    configs = [
+        {"lang": "chi_sim+eng", "config": "--oem 3 --psm 6"},
+        {"lang": "eng", "config": "--oem 3 --psm 6"},
     ]
-    if not target_columns:
-        raise ValueError("CSV 中找不到任何可补全列（物品简述、快递单号、到达时间、购买时间）。")
 
-    target_indices: list[int] = []
-    for index, row in df_out.iterrows():
-        order_id = str(row.get(order_col, "")).strip()
-        if is_empty_value(order_id) or order_id in {"/", "\\"}:
+    text = ""
+    for kwargs in configs:
+        try:
+            text = clean_text(pytesseract.image_to_string(prepared, **kwargs))
+        except Exception:
+            text = ""
+        if text:
+            break
+
+    if not text:
+        return []
+
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def extract_order_candidates(recognized_parts: Iterable[str]) -> list[str]:
+    candidates: dict[str, bool] = {}
+    for part in recognized_parts:
+        text = clean_text(part).upper()
+        if not text:
             continue
-        if any(is_empty_value(row.get(column, None)) for column in target_columns):
-            target_indices.append(index)
-
-    total = len(target_indices)
-    if total == 0:
-        report("info", "没有发现需要补全的空白单元格。")
-        report_progress(1, 1)
-        return df_out
-
-    changed_cells = 0
-    stopped_for_access_limit = False
-    with FIREFOX_LOCK:
-        with ExistingFirefoxScraper(page_wait_seconds, status_cb) as firefox:
-            for position, index in enumerate(target_indices, start=1):
-                row = df_out.loc[index]
-                order_id = str(row[order_col]).strip()
-                report("info", f"({position}/{total}) 正在通过现有 Firefox 打开订单: {order_id}")
-
-                try:
-                    info = scrape_order_detail(order_id, firefox)
-                except FirefoxAccessLimitedError as exc:
-                    report("warning", f"订单 {order_id} 已停止：{exc}")
-                    report_progress(position, total)
-                    stopped_for_access_limit = True
-                    break
-                except Exception as exc:
-                    report("warning", f"订单 {order_id} 抓取失败: {exc}")
-                    report_progress(position, total)
-                else:
-                    filled_fields: list[str] = []
-                    if item_col in df_out.columns and is_empty_value(df_out.at[index, item_col]) and info.item_name:
-                        df_out.at[index, item_col] = info.item_name
-                        filled_fields.append(item_col)
-                        changed_cells += 1
-
-                    if tracking_col in df_out.columns and is_empty_value(df_out.at[index, tracking_col]) and info.tracking_no:
-                        df_out.at[index, tracking_col] = info.tracking_no
-                        filled_fields.append(tracking_col)
-                        changed_cells += 1
-
-                    if arrival_col in df_out.columns and is_empty_value(df_out.at[index, arrival_col]) and info.arrival_time:
-                        df_out.at[index, arrival_col] = info.arrival_time
-                        filled_fields.append(arrival_col)
-                        changed_cells += 1
-
-                    if (
-                        purchase_time_col in df_out.columns
-                        and is_empty_value(df_out.at[index, purchase_time_col])
-                        and info.payment_time
-                    ):
-                        df_out.at[index, purchase_time_col] = info.payment_time
-                        filled_fields.append(purchase_time_col)
-                        changed_cells += 1
-
-                    if filled_fields:
-                        report("info", f"订单 {order_id} 已补全: {', '.join(filled_fields)}")
-                    else:
-                        report("warning", f"订单 {order_id} 已打开，但未识别到可填入的空白字段。")
-                    report_progress(position, total)
-
-                if position < total:
-                    report(
-                        "info",
-                        f"固定等待 {order_interval_seconds:g} 秒后再打开下一订单；期间不会点击页面元素。",
-                    )
-                    time.sleep(order_interval_seconds)
-
-    if stopped_for_access_limit:
-        report("warning", f"任务因访问限制提前停止，已写入 {changed_cells} 个空白单元格。")
-    else:
-        report("success", f"补全完成，共写入 {changed_cells} 个空白单元格。")
-    return df_out
+        for token in ORDER_TOKEN_PATTERN.findall(text):
+            normalized = normalize_token(token)
+            if len(normalized) < 8:
+                continue
+            digit_count = sum(char.isdigit() for char in normalized)
+            if digit_count < 6:
+                continue
+            candidates[normalized] = True
+    return sorted(candidates.keys(), key=lambda item: (-len(item), item))
 
 
-def build_download_bytes(df: pd.DataFrame) -> bytes:
-    buffer = io.StringIO()
-    df.to_csv(buffer, index=False)
-    return buffer.getvalue().encode("utf-8-sig")
-
-
-INDEX_HTML = """
-<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Tmall 订单 CSV 自动补全</title>
-  <style>
-    :root { --ink:#172033; --muted:#64748b; --line:#dbe3ef; --orange:#f05a28; --blue:#276fed; }
-    * { box-sizing:border-box; }
-    body { margin:0; min-height:100vh; font-family:"Segoe UI","Microsoft YaHei",sans-serif; color:var(--ink); background:linear-gradient(135deg,#fff6ef,#eef6ff); }
-    main { max-width:900px; margin:36px auto; padding:0 16px; }
-    section { background:#fff; border:1px solid var(--line); border-radius:18px; box-shadow:0 16px 42px rgba(20,43,86,.10); overflow:hidden; }
-    header { padding:24px; background:linear-gradient(115deg,#fff,#fff4ec); border-bottom:1px solid var(--line); }
-    h1 { margin:0; color:var(--orange); font-size:25px; }
-    header p { color:var(--muted); margin:8px 0 0; }
-    form { padding:24px; display:grid; gap:15px; }
-    .fields { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
-    label { display:block; color:var(--muted); font-size:13px; margin-bottom:6px; }
-    input { width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:9px; font:inherit; }
-    .notice { padding:12px; border-radius:10px; font-size:14px; background:#fff7e9; border:1px solid #ffd89e; color:#76500c; line-height:1.55; }
-    .error { padding:11px 12px; border-radius:10px; color:#a41c2c; background:#fff0f2; border:1px solid #ffc8d0; }
-    button { width:max-content; border:0; border-radius:10px; color:#fff; background:linear-gradient(120deg,var(--orange),var(--blue)); padding:11px 17px; font:600 15px inherit; cursor:pointer; }
-    footer { padding:0 24px 23px; color:var(--muted); font-size:13px; }
-    @media (max-width:640px) { .fields { grid-template-columns:1fr; } }
-  </style>
-</head>
-<body>
-  <main>
-    <section>
-      <header>
-        <h1>Tmall 订单 CSV 自动补全</h1>
-        <p>只补空白单元格；程序直接控制当前已打开的有头 Firefox，不会新启动浏览器进程。</p>
-      </header>
-      <form method="post" action="{{ url_for('process_csv') }}" enctype="multipart/form-data">
-        {% if error %}<div class="error">{{ error }}</div>{% endif %}
-        <div>
-          <label>上传 CSV 文件</label>
-          <input type="file" name="csv_file" accept=".csv" required>
-        </div>
-        <div class="fields">
-          <div><label>订单号列名</label><input type="text" name="order_col" value="订单号"></div>
-          <div><label>物品名称列名</label><input type="text" name="item_col" value="物品简述"></div>
-          <div><label>快递单号列名</label><input type="text" name="tracking_col" value="快递单号"></div>
-          <div><label>到达时间列名</label><input type="text" name="arrival_col" value="到达时间"></div>
-          <div><label>购买时间列名（填入付款时间）</label><input type="text" name="purchase_time_col" value="购买时间"></div>
-                      <div><label>页面加载等待（秒，至少 10）</label><input type="number" name="page_wait_seconds" min="0.5" step="0.5" value="20"></div>
-                      <div><label>订单间固定等待（秒，至少 10）</label><input type="number" name="order_interval_seconds" min="0.5" step="0.5" value="20"></div>
-        </div>
-                <div class="notice">开始前，请确认当前 Firefox 已登录淘宝/天猫且窗口可见。每个订单只执行：在临时标签页地址栏打开一次订单 URL → 固定等待 → 键盘复制一次已渲染正文。不会点击订单、物流、确认收货或任何页面按钮；不会轮询或重试同一个订单。若出现访问受限/操作频繁提示，任务会立即停止。</div>
-        <button type="submit">开始补全并生成下载</button>
-      </form>
-      <footer>如果某个订单抓取失败，会保留原值；结果页日志会显示每个订单的成功、失败与实际写入列。</footer>
-    </section>
-  </main>
-</body>
-</html>
-"""
-
-
-RESULT_HTML = """
-<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>补全完成</title>
-  <style>
-    body { margin:0; font-family:"Segoe UI","Microsoft YaHei",sans-serif; color:#172033; background:#f4f7fb; }
-    main { max-width:900px; margin:36px auto; padding:0 16px; }
-    section { background:#fff; border:1px solid #dbe3ef; border-radius:18px; padding:24px; box-shadow:0 16px 42px rgba(20,43,86,.10); }
-    h1 { margin:0 0 18px; color:#168246; }
-    .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-bottom:18px; }
-    .stat { padding:12px; border:1px solid #dbe3ef; border-radius:10px; background:#f9fbff; }
-    .btn { display:inline-block; padding:11px 17px; background:linear-gradient(120deg,#f05a28,#276fed); color:#fff; border-radius:10px; text-decoration:none; font-weight:600; }
-    .back { display:inline-block; margin-left:15px; color:#276fed; }
-    pre { margin:18px 0 0; max-height:340px; overflow:auto; padding:13px; border-radius:10px; background:#111827; color:#e5e7eb; white-space:pre-wrap; line-height:1.5; font:12px Consolas,monospace; }
-    @media (max-width:640px) { .stats { grid-template-columns:1fr; } }
-  </style>
-</head>
-<body>
-  <main><section>
-    <h1>补全完成</h1>
-    <div class="stats">
-      <div class="stat">总行数：{{ total_rows }}</div>
-      <div class="stat">变化单元格：{{ changed_cells }}</div>
-      <div class="stat">待补全订单：{{ target_rows }}</div>
-    </div>
-    <a class="btn" href="{{ url_for('download_result', token=token) }}">下载补全后的 CSV</a>
-    <a class="back" href="{{ url_for('index') }}">返回上传页</a>
-    <pre>{{ logs_text }}</pre>
-  </section></main>
-</body>
-</html>
-"""
-
-
-def _form_text(name: str, fallback: str) -> str:
-    return (request.form.get(name) or "").strip() or fallback
-
-
-def _form_seconds(field_name: str, label: str, default: float, minimum: float) -> float:
-    raw_value = (request.form.get(field_name) or "").strip()
-    if not raw_value:
-        return default
+def analyze_pickup_image(image_path: Path) -> tuple[list[str], list[str], list[str], str]:
     try:
-        value = float(raw_value)
-    except ValueError as exc:
-        raise ValueError(f"{label} 必须是数字。") from exc
-    if value < minimum:
-        raise ValueError(f"{label} 不能少于 {minimum:g} 秒。")
-    return value
+        image = Image.open(image_path).convert("RGB")
+    except Exception as exc:
+        raise ValueError("图片解析失败，请上传清晰的 JPG/PNG 图片。") from exc
+
+    barcode_values = decode_barcodes(np.array(image))
+    ocr_lines = decode_ocr_lines(image)
+    recognized_parts = barcode_values + ocr_lines
+    candidates = extract_order_candidates(recognized_parts)
+    extracted_text = "\n".join(recognized_parts)
+    return candidates, barcode_values, ocr_lines, extracted_text
 
 
-def _count_changed_cells(before: pd.DataFrame, after: pd.DataFrame) -> int:
-    left = before.fillna("").astype(str)
-    right = after.fillna("").astype(str)
-    return int((left != right).sum().sum())
+def match_reminders(candidates: list[str], reminders: list[Reminder]) -> list[tuple[str, Reminder]]:
+    matched: list[tuple[str, Reminder]] = []
+    for candidate in candidates:
+        for reminder in reminders:
+            if candidate.endswith(reminder.order_suffix):
+                matched.append((candidate, reminder))
+    return matched
 
 
-def _count_target_rows(
-    df: pd.DataFrame,
-    order_col: str,
-    target_columns: tuple[str, ...],
+def create_notifications_for_matches(
+    db_session,
+    scanner: User,
+    pickup_event: PickupEvent,
+    matches: list[tuple[str, Reminder]],
 ) -> int:
-    if order_col not in df.columns:
-        return 0
-    existing_columns = [column for column in target_columns if column in df.columns]
-    return sum(
-        not is_empty_value(row.get(order_col, ""))
-        and any(is_empty_value(row.get(column, None)) for column in existing_columns)
-        for _, row in df.iterrows()
+    chosen_by_reminder: dict[int, tuple[str, Reminder]] = {}
+    for candidate, reminder in matches:
+        chosen_by_reminder.setdefault(reminder.id, (candidate, reminder))
+
+    created = 0
+    for candidate, reminder in chosen_by_reminder.values():
+        custom_message = clean_text(reminder.custom_message) or DEFAULT_NOTIFY_MESSAGE
+        member_rows = db_session.scalars(
+            select(GroupMember).where(GroupMember.group_id == reminder.group_id)
+        ).all()
+
+        for member in member_rows:
+            title = f"{reminder.group.name} 取件通知"
+            body = (
+                f"{custom_message}\n"
+                f"命中尾号: {reminder.order_suffix}\n"
+                f"识别单号: {candidate}\n"
+                f"取件人: {scanner.username}"
+            )
+            db_session.add(
+                Notification(
+                    user_id=member.user_id,
+                    group_id=reminder.group_id,
+                    reminder_id=reminder.id,
+                    pickup_event_id=pickup_event.id,
+                    title=title,
+                    body=body,
+                )
+            )
+            created += 1
+    return created
+
+
+def get_user_groups(db_session, user_id: int) -> list[UserGroup]:
+    stmt = (
+        select(UserGroup)
+        .join(GroupMember, GroupMember.group_id == UserGroup.id)
+        .where(GroupMember.user_id == user_id)
+        .order_by(desc(UserGroup.created_at))
     )
+    return db_session.scalars(stmt).unique().all()
+
+
+def get_membership(db_session, group_id: int, user_id: int) -> GroupMember | None:
+    return db_session.scalar(
+        select(GroupMember).where(
+            GroupMember.group_id == group_id,
+            GroupMember.user_id == user_id,
+        )
+    )
+
+
+def login_required(view_func):
+    @wraps(view_func)
+    def wrapper(*args, **kwargs):
+        if g.current_user is None:
+            flash("请先登录。", "warning")
+            return redirect(url_for("login"))
+        return view_func(*args, **kwargs)
+
+    return wrapper
+
+
+@app.context_processor
+def inject_template_globals():
+    return {
+        "current_user": getattr(g, "current_user", None),
+        "ui_build_id": UI_BUILD_ID,
+        "ui_css_file": UI_CSS_FILE,
+        "ui_js_file": UI_JS_FILE,
+    }
+
+
+@app.before_request
+def open_db_session():
+    g.db = SessionLocal()
+    g.current_user = None
+    user_id = session.get("user_id")
+    if user_id:
+        g.current_user = g.db.get(User, user_id)
+
+
+@app.teardown_request
+def close_db_session(error):
+    db_session = g.pop("db", None)
+    if db_session is None:
+        SessionLocal.remove()
+        return
+    try:
+        if error is not None:
+            db_session.rollback()
+    finally:
+        db_session.close()
+        SessionLocal.remove()
 
 
 @app.get("/")
-def index():
-    return render_template_string(INDEX_HTML, error=request.args.get("error", ""))
+def home():
+    if g.current_user:
+        return redirect(url_for("dashboard"))
+    return redirect(url_for("login"))
 
 
-@app.post("/process")
-def process_csv():
-    uploaded = request.files.get("csv_file")
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if g.current_user:
+        return redirect(url_for("dashboard"))
+
+    if request.method == "POST":
+        username = clean_text(request.form.get("username"))
+        password = request.form.get("password", "")
+        password_confirm = request.form.get("password_confirm", "")
+        db_session = g.db
+
+        if len(username) < 3:
+            flash("用户名至少 3 个字符。", "danger")
+            return render_template("register.html")
+        if len(password) < 6:
+            flash("密码至少 6 个字符。", "danger")
+            return render_template("register.html")
+        if password != password_confirm:
+            flash("两次密码输入不一致。", "danger")
+            return render_template("register.html")
+        if db_session.scalar(select(User).where(User.username == username)):
+            flash("用户名已存在，请换一个。", "danger")
+            return render_template("register.html")
+
+        db_session.add(User(username=username, password_hash=generate_password_hash(password)))
+        db_session.commit()
+        flash("注册成功，请登录。", "success")
+        return redirect(url_for("login"))
+
+    return render_template("register.html")
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if g.current_user:
+        return redirect(url_for("dashboard"))
+
+    if request.method == "POST":
+        username = clean_text(request.form.get("username"))
+        password = request.form.get("password", "")
+        db_session = g.db
+        user = db_session.scalar(select(User).where(User.username == username))
+
+        if user is None or not check_password_hash(user.password_hash, password):
+            flash("用户名或密码错误。", "danger")
+            return render_template("login.html")
+
+        session["user_id"] = user.id
+        flash("登录成功。", "success")
+        return redirect(url_for("dashboard"))
+
+    return render_template("login.html")
+
+
+@app.get("/logout")
+def logout():
+    session.clear()
+    flash("已退出登录。", "info")
+    return redirect(url_for("login"))
+
+
+@app.get("/dashboard")
+@login_required
+def dashboard():
+    db_session = g.db
+    user = g.current_user
+    groups = get_user_groups(db_session, user.id)
+    group_ids = [group.id for group in groups]
+
+    unread_count = db_session.scalar(
+        select(func.count(Notification.id)).where(
+            Notification.user_id == user.id,
+            Notification.is_read.is_(False),
+        )
+    ) or 0
+
+    recent_notifications = db_session.scalars(
+        select(Notification)
+        .where(Notification.user_id == user.id)
+        .order_by(desc(Notification.created_at))
+        .limit(8)
+    ).all()
+
+    parcel_count = db_session.scalar(select(func.count(Parcel.id))) or 0
+    active_reminders = 0
+    if group_ids:
+        active_reminders = db_session.scalar(
+            select(func.count(Reminder.id)).where(
+                Reminder.group_id.in_(group_ids),
+                Reminder.is_active.is_(True),
+            )
+        ) or 0
+
+    return render_template(
+        "dashboard.html",
+        groups=groups,
+        parcel_count=parcel_count,
+        active_reminders=active_reminders,
+        unread_count=unread_count,
+        recent_notifications=recent_notifications,
+        default_notify_message=DEFAULT_NOTIFY_MESSAGE,
+    )
+
+
+@app.post("/import-logistics")
+@login_required
+def import_logistics():
+    uploaded = request.files.get("sheet_file")
     if not uploaded or not uploaded.filename:
-        return redirect(url_for("index", error="请先上传 CSV 文件。"))
-
-    order_col = _form_text("order_col", "订单号")
-    item_col = _form_text("item_col", "物品简述")
-    tracking_col = _form_text("tracking_col", "快递单号")
-    arrival_col = _form_text("arrival_col", "到达时间")
-    purchase_time_col = _form_text("purchase_time_col", "购买时间")
-    try:
-        page_wait_seconds = _form_seconds(
-            "page_wait_seconds",
-            "页面加载等待",
-            DEFAULT_PAGE_WAIT_SECONDS,
-            MIN_PAGE_WAIT_SECONDS,
-        )
-        order_interval_seconds = _form_seconds(
-            "order_interval_seconds",
-            "订单间固定等待",
-            DEFAULT_ORDER_INTERVAL_SECONDS,
-            MIN_ORDER_INTERVAL_SECONDS,
-        )
-    except ValueError as exc:
-        return redirect(url_for("index", error=str(exc)))
+        flash("请先上传物流表（CSV/XLS/XLSX）。", "danger")
+        return redirect(url_for("dashboard"))
 
     try:
-        original = pd.read_csv(uploaded, dtype=str, keep_default_na=False)
+        df = load_table_from_upload(uploaded)
     except Exception as exc:
-        return redirect(url_for("index", error=f"CSV 读取失败: {exc}"))
+        flash(f"文件读取失败：{exc}", "danger")
+        return redirect(url_for("dashboard"))
 
-    logs: list[str] = []
-
-    def status_cb(level: str, message: str) -> None:
-        logs.append(f"[{level}] {message}")
-
-    def progress_cb(done: int, total: int) -> None:
-        logs.append(f"[progress] {done}/{total}")
-
-    target_rows = _count_target_rows(
-        original,
-        order_col,
-        (item_col, tracking_col, arrival_col, purchase_time_col),
-    )
-
+    db_session = g.db
     try:
-        completed = fill_csv(
-            df=original,
-            order_col=order_col,
-            item_col=item_col,
-            tracking_col=tracking_col,
-            arrival_col=arrival_col,
-            purchase_time_col=purchase_time_col,
-            page_wait_seconds=page_wait_seconds,
-            order_interval_seconds=order_interval_seconds,
-            status_cb=status_cb,
-            progress_cb=progress_cb,
-        )
+        inserted, updated, skipped = import_parcel_dataframe(db_session, df)
+        db_session.commit()
     except Exception as exc:
-        return redirect(url_for("index", error=f"补全过程失败: {exc}"))
+        db_session.rollback()
+        flash(f"导入失败：{exc}", "danger")
+        return redirect(url_for("dashboard"))
 
-    token = secrets.token_urlsafe(12)
-    RESULT_STORE[token] = {
-        "bytes": build_download_bytes(completed),
-        "total_rows": len(original),
-        "target_rows": target_rows,
-        "changed_cells": _count_changed_cells(original, completed),
-        "logs": logs[-250:],
-    }
-    return redirect(url_for("result_page", token=token))
-
-
-@app.get("/result/<token>")
-def result_page(token: str):
-    result = RESULT_STORE.get(token)
-    if result is None:
-        abort(404)
-    return render_template_string(
-        RESULT_HTML,
-        token=token,
-        total_rows=result["total_rows"],
-        target_rows=result["target_rows"],
-        changed_cells=result["changed_cells"],
-        logs_text="\n".join(result["logs"]) or "无日志输出",
+    flash(
+        f"导入完成：新增 {inserted} 条，更新 {updated} 条，跳过 {skipped} 条（无订单号）。",
+        "success",
     )
+    return redirect(url_for("dashboard"))
 
 
-@app.get("/download/<token>")
-def download_result(token: str):
-    result = RESULT_STORE.get(token)
-    if result is None:
-        abort(404)
-    return send_file(
-        io.BytesIO(result["bytes"]),
-        as_attachment=True,
-        download_name="completed_orders.csv",
-        mimetype="text/csv",
+@app.post("/groups/create")
+@login_required
+def create_group():
+    group_name = clean_text(request.form.get("group_name"))
+    if not group_name:
+        flash("组名不能为空。", "danger")
+        return redirect(url_for("dashboard"))
+
+    db_session = g.db
+    group = UserGroup(name=group_name, created_by=g.current_user.id)
+    db_session.add(group)
+    db_session.flush()
+    db_session.add(GroupMember(group_id=group.id, user_id=g.current_user.id, role="owner"))
+    db_session.commit()
+
+    flash(f"已创建用户组：{group_name}", "success")
+    return redirect(url_for("dashboard"))
+
+
+@app.post("/groups/<int:group_id>/members/add")
+@login_required
+def add_group_member(group_id: int):
+    db_session = g.db
+    membership = get_membership(db_session, group_id, g.current_user.id)
+    if membership is None or membership.role != "owner":
+        flash("只有组主可以添加成员。", "danger")
+        return redirect(url_for("dashboard"))
+
+    username = clean_text(request.form.get("username"))
+    if not username:
+        flash("成员用户名不能为空。", "danger")
+        return redirect(url_for("dashboard"))
+
+    user_to_add = db_session.scalar(select(User).where(User.username == username))
+    if user_to_add is None:
+        flash("找不到这个用户，请先注册账号。", "danger")
+        return redirect(url_for("dashboard"))
+
+    if get_membership(db_session, group_id, user_to_add.id):
+        flash("该用户已经在组里了。", "info")
+        return redirect(url_for("dashboard"))
+
+    db_session.add(GroupMember(group_id=group_id, user_id=user_to_add.id, role="member"))
+    db_session.commit()
+    flash(f"已添加成员：{username}", "success")
+    return redirect(url_for("dashboard"))
+
+
+@app.post("/groups/<int:group_id>/reminders/create")
+@login_required
+def create_reminder(group_id: int):
+    db_session = g.db
+    membership = get_membership(db_session, group_id, g.current_user.id)
+    if membership is None:
+        flash("你不是该组成员，不能设置提醒。", "danger")
+        return redirect(url_for("dashboard"))
+
+    suffix = normalize_token(request.form.get("order_suffix"))
+    custom_message = clean_text(request.form.get("custom_message")) or DEFAULT_NOTIFY_MESSAGE
+
+    if len(suffix) < 4:
+        flash("订单尾号至少输入 4 位。", "danger")
+        return redirect(url_for("dashboard"))
+
+    db_session.add(
+        Reminder(
+            group_id=group_id,
+            created_by=g.current_user.id,
+            order_suffix=suffix,
+            custom_message=custom_message,
+            is_active=True,
+        )
+    )
+    db_session.commit()
+    flash(f"提醒已创建：尾号 {suffix}", "success")
+    return redirect(url_for("dashboard"))
+
+
+@app.post("/reminders/<int:reminder_id>/toggle")
+@login_required
+def toggle_reminder(reminder_id: int):
+    db_session = g.db
+    reminder = db_session.get(Reminder, reminder_id)
+    if reminder is None:
+        flash("提醒不存在。", "danger")
+        return redirect(url_for("dashboard"))
+
+    membership = get_membership(db_session, reminder.group_id, g.current_user.id)
+    if membership is None:
+        flash("你不是该组成员，不能修改提醒。", "danger")
+        return redirect(url_for("dashboard"))
+
+    reminder.is_active = not reminder.is_active
+    db_session.commit()
+    status_text = "启用" if reminder.is_active else "停用"
+    flash(f"提醒已{status_text}：尾号 {reminder.order_suffix}", "success")
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/scan", methods=["GET", "POST"])
+@login_required
+def scan():
+    scan_result = None
+    if request.method == "POST":
+        uploaded_image = request.files.get("pickup_image")
+        if not uploaded_image or not uploaded_image.filename:
+            flash("请上传拍照图片。", "danger")
+            return redirect(url_for("scan"))
+
+        suffix = Path(uploaded_image.filename).suffix.lower()
+        if suffix not in ALLOWED_IMAGE_SUFFIXES:
+            flash("图片格式不支持，请上传 JPG/PNG/WEBP/BMP/TIF。", "danger")
+            return redirect(url_for("scan"))
+
+        unique_name = (
+            f"{dt.datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+            f"_{uuid.uuid4().hex[:8]}_{secure_filename(uploaded_image.filename)}"
+        )
+        target_path = UPLOAD_DIR / unique_name
+        uploaded_image.save(target_path)
+
+        try:
+            candidates, barcode_values, ocr_lines, extracted_text = analyze_pickup_image(target_path)
+        except Exception as exc:
+            flash(f"识别失败：{exc}", "danger")
+            return redirect(url_for("scan"))
+
+        db_session = g.db
+        reminders = db_session.scalars(
+            select(Reminder).where(Reminder.is_active.is_(True)).order_by(Reminder.created_at.asc())
+        ).all()
+        matches = match_reminders(candidates, reminders)
+
+        matched_groups: dict[int, UserGroup] = {}
+        for _, reminder in matches:
+            matched_groups[reminder.group_id] = reminder.group
+        shown_group = random.choice(list(matched_groups.values())) if matched_groups else None
+
+        pickup_event = PickupEvent(
+            scanner_user_id=g.current_user.id,
+            image_path=str(target_path.relative_to(APP_DIR)),
+            extracted_text=extracted_text,
+            detected_order_no=candidates[0] if candidates else "",
+            shown_group_id=shown_group.id if shown_group else None,
+        )
+        db_session.add(pickup_event)
+        db_session.flush()
+
+        notifications_created = create_notifications_for_matches(
+            db_session=db_session,
+            scanner=g.current_user,
+            pickup_event=pickup_event,
+            matches=matches,
+        )
+        db_session.commit()
+
+        row_by_reminder: dict[int, dict[str, object]] = {}
+        for candidate, reminder in matches:
+            if reminder.id not in row_by_reminder:
+                member_count = db_session.scalar(
+                    select(func.count(GroupMember.id)).where(GroupMember.group_id == reminder.group_id)
+                ) or 0
+                row_by_reminder[reminder.id] = {
+                    "group_name": reminder.group.name,
+                    "suffix": reminder.order_suffix,
+                    "candidate": candidate,
+                    "message": reminder.custom_message,
+                    "member_count": member_count,
+                }
+
+        scan_result = {
+            "barcode_values": barcode_values,
+            "ocr_lines": ocr_lines,
+            "candidates": candidates,
+            "shown_group": shown_group.name if shown_group else "未匹配到组别",
+            "notifications_created": notifications_created,
+            "match_rows": list(row_by_reminder.values()),
+        }
+
+    return render_template("scan.html", scan_result=scan_result)
+
+
+@app.get("/notifications")
+@login_required
+def notifications():
+    db_session = g.db
+    rows = db_session.scalars(
+        select(Notification)
+        .where(Notification.user_id == g.current_user.id)
+        .order_by(desc(Notification.created_at))
+        .limit(300)
+    ).all()
+    return render_template("notifications.html", notifications=rows)
+
+
+@app.post("/notifications/read-all")
+@login_required
+def read_all_notifications():
+    db_session = g.db
+    unread_rows = db_session.scalars(
+        select(Notification).where(
+            Notification.user_id == g.current_user.id,
+            Notification.is_read.is_(False),
+        )
+    ).all()
+    for row in unread_rows:
+        row.is_read = True
+    db_session.commit()
+    flash("已标记全部通知为已读。", "success")
+    return redirect(url_for("notifications"))
+
+
+@app.get("/parcels")
+@login_required
+def parcels():
+    db_session = g.db
+    keyword = clean_text(request.args.get("q", ""))
+    query = select(Parcel).order_by(desc(Parcel.updated_at), desc(Parcel.created_at))
+    if keyword:
+        like_term = f"%{keyword.upper()}%"
+        query = query.where(
+            or_(
+                func.upper(Parcel.order_no).like(like_term),
+                func.upper(Parcel.tracking_no).like(like_term),
+                func.upper(Parcel.item_desc).like(like_term),
+            )
+        )
+
+    rows = db_session.scalars(query.limit(300)).all()
+    reminders = db_session.scalars(select(Reminder).where(Reminder.is_active.is_(True))).all()
+
+    destination_by_parcel: dict[int, str] = {}
+    for parcel in rows:
+        order_no = normalize_token(parcel.order_no)
+        group_candidates = [reminder.group.name for reminder in reminders if order_no.endswith(reminder.order_suffix)]
+        destination_by_parcel[parcel.id] = random.choice(group_candidates) if group_candidates else "未分组"
+
+    return render_template(
+        "parcels.html",
+        parcels=rows,
+        keyword=request.args.get("q", ""),
+        destination_by_parcel=destination_by_parcel,
     )
 
 
 def main() -> None:
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    init_db()
+    app.run(host="0.0.0.0", port=5000, debug=False)
 
 
 if __name__ == "__main__":

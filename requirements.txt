@@ -1,5 +1,9 @@
 flask>=3.0.3
+sqlalchemy>=2.0.31
+psycopg2-binary>=2.9.9
 pandas>=2.2.2
-PyAutoGUI>=0.9.54
-PyGetWindow>=0.0.9
-pyperclip>=1.9.0
+openpyxl>=3.1.5
+numpy>=1.26.4
+zxing-cpp>=2.2.0
+pillow>=11.0.0
+pytesseract>=0.3.13
