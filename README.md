@@ -74,7 +74,8 @@ python batch_fill.py --input your_logistics.xlsx
 
 ## 6) 关键说明
 
-- 条码识别使用 `zxing-cpp`。
-- OCR 使用 `pytesseract`（需要系统安装 Tesseract OCR 可执行程序）。
+- 条码识别使用 `zxing-cpp`（原生扩展模块，随 pip 安装，非系统可执行程序）。
+- OCR 使用 `easyocr`（PyTorch 模型，纯 pip 安装，进程内运行，不依赖任何系统可执行程序，可放心部署到任意 Linux 环境）。首次识别会自动下载一次模型权重文件（约几十至上百 MB，含中英文），之后离线复用本地缓存（默认缓存目录 `~/.EasyOCR`）。
+- 若机器有 NVIDIA GPU 且 PyTorch 检测到 CUDA，会自动使用 GPU 加速；否则自动回退到 CPU，无需额外配置。
 - 扫描命中规则：识别出的订单号 `endswith(提醒尾号)`。
 - 通知为站内通知（写入数据库）。

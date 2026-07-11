@@ -4,6 +4,7 @@ import datetime as dt
 import os
 import random
 import re
+import threading
 import uuid
 from functools import wraps
 from pathlib import Path
@@ -329,32 +330,58 @@ def decode_barcodes(image: np.ndarray) -> list[str]:
     return list(dict.fromkeys(values))
 
 
+_OCR_READER = None
+_OCR_READER_LOCK = threading.Lock()
+
+
+def _get_ocr_reader():
+    """Lazily build a PyTorch-backed OCR reader (EasyOCR).
+
+    This intentionally avoids any external OS executable (e.g. the Tesseract
+    binary): the model weights are plain data files downloaded once via pip's
+    own cache/model-download machinery and executed in-process through
+    PyTorch, so this keeps working unchanged if the app is dropped into a
+    fresh Linux container.
+    """
+    global _OCR_READER
+    if _OCR_READER is not None:
+        return _OCR_READER
+
+    with _OCR_READER_LOCK:
+        if _OCR_READER is None:
+            import easyocr
+            import torch
+
+            _OCR_READER = easyocr.Reader(
+                ["ch_sim", "en"],
+                gpu=torch.cuda.is_available(),
+                verbose=False,
+            )
+    return _OCR_READER
+
+
 def decode_ocr_lines(image: Image.Image) -> list[str]:
     try:
-        import pytesseract
+        reader = _get_ocr_reader()
     except Exception:
         return []
 
-    # Use grayscale + autocontrast to increase OCR robustness for courier labels.
+    # Grayscale + autocontrast increases OCR robustness for courier labels.
     prepared = ImageOps.autocontrast(ImageOps.grayscale(image))
-    configs = [
-        {"lang": "chi_sim+eng", "config": "--oem 3 --psm 6"},
-        {"lang": "eng", "config": "--oem 3 --psm 6"},
-    ]
 
-    text = ""
-    for kwargs in configs:
-        try:
-            text = clean_text(pytesseract.image_to_string(prepared, **kwargs))
-        except Exception:
-            text = ""
-        if text:
-            break
-
-    if not text:
+    try:
+        results = reader.readtext(np.array(prepared), detail=1, paragraph=False)
+    except Exception:
         return []
 
-    return [line.strip() for line in text.splitlines() if line.strip()]
+    lines: list[str] = []
+    for entry in results:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        text = clean_text(entry[1])
+        if text:
+            lines.append(text)
+    return lines
 
 
 def extract_order_candidates(recognized_parts: Iterable[str]) -> list[str]:
