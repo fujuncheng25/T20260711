@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import io
 import re
 import secrets
@@ -35,6 +36,10 @@ ARRIVAL_PATTERN = re.compile(
 COURIER_PREFIX_PATTERN = re.compile(
     r"^(?:SF|YT|JT|JDAP|DPK|LP|ZTO|STO|EMS|YUNDA|JD|DBK)", re.IGNORECASE
 )
+DEFAULT_PAGE_WAIT_SECONDS = 20.0
+DEFAULT_ORDER_INTERVAL_SECONDS = 20.0
+MIN_PAGE_WAIT_SECONDS = 10.0
+MIN_ORDER_INTERVAL_SECONDS = 10.0
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
@@ -48,6 +53,10 @@ class OrderInfo:
     tracking_no: str = ""
     arrival_time: str = ""
     payment_time: str = ""
+
+
+class FirefoxAccessLimitedError(RuntimeError):
+    """Raised when Firefox shows an access-control or rate-limit page."""
 
 
 def is_empty_value(value: object) -> bool:
@@ -208,12 +217,32 @@ def _find_firefox_window():
     return max(candidates, key=lambda window: window.width * window.height)
 
 
+def _window_handle(window) -> int:
+    try:
+        return int(getattr(window, "_hWnd", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _foreground_window_handle() -> int:
+    try:
+        return int(ctypes.windll.user32.GetForegroundWindow())
+    except (AttributeError, OSError):
+        return 0
+
+
 class ExistingFirefoxScraper:
     """Controls an existing visible Firefox window; it never launches a browser process."""
 
-    def __init__(self, status_cb: Optional[Callable[[str, str], None]] = None) -> None:
+    def __init__(
+        self,
+        page_wait_seconds: float,
+        status_cb: Optional[Callable[[str, str], None]] = None,
+    ) -> None:
+        self._page_wait_seconds = page_wait_seconds
         self._status_cb = status_cb
         self._firefox_window = _find_firefox_window()
+        self._firefox_handle = _window_handle(self._firefox_window)
         self._previous_window = None
         self._previous_clipboard = ""
         self._temporary_tab_opened = False
@@ -226,10 +255,27 @@ class ExistingFirefoxScraper:
         try:
             if getattr(self._firefox_window, "isMinimized", False):
                 self._firefox_window.restore()
+            if self._firefox_handle:
+                user32 = ctypes.windll.user32
+                user32.BringWindowToTop(self._firefox_handle)
+                user32.SetForegroundWindow(self._firefox_handle)
             self._firefox_window.activate()
         except Exception as exc:
             raise RuntimeError(f"无法激活现有 Firefox 窗口: {exc}") from exc
-        time.sleep(0.45)
+        time.sleep(0.8)
+
+        active_window = gw.getActiveWindow()
+        active_handle = _foreground_window_handle()
+        is_expected_handle = bool(self._firefox_handle and active_handle == self._firefox_handle)
+        is_firefox_title = bool(
+            active_window and "firefox" in (active_window.title or "").lower()
+        )
+        is_foreground = is_expected_handle if self._firefox_handle else is_firefox_title
+        if not is_foreground:
+            raise RuntimeError(
+                "Firefox 未成为前台窗口。为避免快捷键发到其他程序，本次不会打开或读取订单；"
+                "请将 Firefox 放到最前面后重试。"
+            )
 
     def __enter__(self) -> "ExistingFirefoxScraper":
         try:
@@ -244,17 +290,24 @@ class ExistingFirefoxScraper:
 
         self._activate_firefox()
         pyautogui.hotkey("ctrl", "t")
-        time.sleep(0.35)
+        time.sleep(0.8)
         self._temporary_tab_opened = True
-        self._report("info", "已连接到当前有头 Firefox；将在同一窗口的临时标签页中读取订单详情。")
+        self._report(
+            "info",
+            "已确认当前有头 Firefox 在前台，并已在同一窗口请求新建临时标签页；不点击页面元素。",
+        )
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         try:
             if self._temporary_tab_opened:
-                self._activate_firefox()
-                pyautogui.hotkey("ctrl", "w")
-                time.sleep(0.35)
+                try:
+                    self._activate_firefox()
+                except RuntimeError:
+                    self._report("warning", "Firefox 未在前台，临时标签页未自动关闭。")
+                else:
+                    pyautogui.hotkey("ctrl", "w")
+                    time.sleep(0.35)
         finally:
             try:
                 pyperclip.copy(self._previous_clipboard)
@@ -268,14 +321,23 @@ class ExistingFirefoxScraper:
 
     def _copy_rendered_page_text(self) -> str:
         self._activate_firefox()
-        pyautogui.hotkey("ctrl", "a")
-        time.sleep(0.1)
-        pyautogui.hotkey("ctrl", "c")
-        time.sleep(0.25)
+        clipboard_marker = "__TMALL_CSV_COPY_PENDING__"
         try:
-            return str(pyperclip.paste()).strip()
+            pyperclip.copy(clipboard_marker)
+        except Exception:
+            clipboard_marker = ""
+        pyautogui.hotkey("ctrl", "a")
+        time.sleep(0.2)
+        pyautogui.hotkey("ctrl", "c")
+        time.sleep(0.6)
+        try:
+            page_text = str(pyperclip.paste()).strip()
         except Exception as exc:
             raise RuntimeError(f"无法从 Firefox 复制已渲染页面内容: {exc}") from exc
+
+        if clipboard_marker and page_text == clipboard_marker:
+            raise RuntimeError("Firefox 未复制到页面正文；请确认浏览器窗口未被遮挡且未最小化。")
+        return page_text
 
     @staticmethod
     def _is_order_detail_page(text: str) -> bool:
@@ -286,36 +348,30 @@ class ExistingFirefoxScraper:
         markers = ("请登录", "扫码登录", "密码登录", "访问受限", "操作频繁", "系统繁忙")
         return any(marker in text for marker in markers)
 
-    def get_order_page_text(self, order_id: str, timeout_seconds: int = 45) -> str:
+    def get_order_page_text(self, order_id: str) -> str:
         url = BASE_URL.format(order_id=order_id)
         self._activate_firefox()
         pyautogui.hotkey("ctrl", "l")
-        time.sleep(0.1)
-        pyautogui.write(url, interval=0.001)
+        time.sleep(0.2)
+        pyautogui.write(url, interval=0.01)
         pyautogui.press("enter")
 
-        deadline = time.monotonic() + timeout_seconds
-        previous_text = ""
-        stable_reads = 0
-        while time.monotonic() < deadline:
-            time.sleep(1.0)
-            page_text = self._copy_rendered_page_text()
+        self._report(
+            "info",
+            f"订单 {order_id} 已打开；固定等待 {self._page_wait_seconds:g} 秒让页面自然加载，不点击订单页内容。",
+        )
+        time.sleep(self._page_wait_seconds)
+        page_text = self._copy_rendered_page_text()
 
-            if self._is_login_or_blocked_page(page_text):
-                raise RuntimeError("当前 Firefox 未保持天猫登录态，或页面触发访问限制。请先在该 Firefox 中完成登录后重试。")
-            if not self._is_order_detail_page(page_text):
-                previous_text = page_text
-                continue
-
-            if page_text == previous_text:
-                stable_reads += 1
-            else:
-                previous_text = page_text
-                stable_reads = 0
-            if stable_reads >= 1:
-                return page_text
-
-        raise RuntimeError("订单详情在现有 Firefox 中加载超时，未读到订单页面文字。")
+        if self._is_login_or_blocked_page(page_text):
+            if any(marker in page_text for marker in ("访问受限", "操作频繁", "系统繁忙")):
+                raise FirefoxAccessLimitedError(
+                    "Firefox 显示访问受限或操作频繁提示，已停止后续订单，避免继续发起请求。"
+                )
+            raise RuntimeError("当前 Firefox 未保持天猫登录态；请先在该 Firefox 中完成登录后重试。")
+        if not self._is_order_detail_page(page_text):
+            raise RuntimeError("未读到订单详情页正文；本订单不会重试。")
+        return page_text
 
 
 def scrape_order_detail(order_id: str, firefox: ExistingFirefoxScraper) -> OrderInfo:
@@ -337,6 +393,8 @@ def fill_csv(
     tracking_col: str,
     arrival_col: str,
     purchase_time_col: str,
+    page_wait_seconds: float = DEFAULT_PAGE_WAIT_SECONDS,
+    order_interval_seconds: float = DEFAULT_ORDER_INTERVAL_SECONDS,
     status_cb: Optional[Callable[[str, str], None]] = None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
 ) -> pd.DataFrame:
@@ -353,6 +411,10 @@ def fill_csv(
 
     if order_col not in df_out.columns:
         raise ValueError(f"CSV 中找不到订单列: {order_col}")
+    if page_wait_seconds < MIN_PAGE_WAIT_SECONDS:
+        raise ValueError(f"页面加载等待时间不能少于 {MIN_PAGE_WAIT_SECONDS:g} 秒。")
+    if order_interval_seconds < MIN_ORDER_INTERVAL_SECONDS:
+        raise ValueError(f"订单间隔不能少于 {MIN_ORDER_INTERVAL_SECONDS:g} 秒。")
 
     target_columns = [
         column
@@ -377,52 +439,67 @@ def fill_csv(
         return df_out
 
     changed_cells = 0
+    stopped_for_access_limit = False
     with FIREFOX_LOCK:
-        with ExistingFirefoxScraper(status_cb) as firefox:
+        with ExistingFirefoxScraper(page_wait_seconds, status_cb) as firefox:
             for position, index in enumerate(target_indices, start=1):
                 row = df_out.loc[index]
                 order_id = str(row[order_col]).strip()
-                report("info", f"({position}/{total}) 正在通过现有 Firefox 抓取订单: {order_id}")
+                report("info", f"({position}/{total}) 正在通过现有 Firefox 打开订单: {order_id}")
 
                 try:
                     info = scrape_order_detail(order_id, firefox)
+                except FirefoxAccessLimitedError as exc:
+                    report("warning", f"订单 {order_id} 已停止：{exc}")
+                    report_progress(position, total)
+                    stopped_for_access_limit = True
+                    break
                 except Exception as exc:
                     report("warning", f"订单 {order_id} 抓取失败: {exc}")
                     report_progress(position, total)
-                    continue
-
-                filled_fields: list[str] = []
-                if item_col in df_out.columns and is_empty_value(df_out.at[index, item_col]) and info.item_name:
-                    df_out.at[index, item_col] = info.item_name
-                    filled_fields.append(item_col)
-                    changed_cells += 1
-
-                if tracking_col in df_out.columns and is_empty_value(df_out.at[index, tracking_col]) and info.tracking_no:
-                    df_out.at[index, tracking_col] = info.tracking_no
-                    filled_fields.append(tracking_col)
-                    changed_cells += 1
-
-                if arrival_col in df_out.columns and is_empty_value(df_out.at[index, arrival_col]) and info.arrival_time:
-                    df_out.at[index, arrival_col] = info.arrival_time
-                    filled_fields.append(arrival_col)
-                    changed_cells += 1
-
-                if (
-                    purchase_time_col in df_out.columns
-                    and is_empty_value(df_out.at[index, purchase_time_col])
-                    and info.payment_time
-                ):
-                    df_out.at[index, purchase_time_col] = info.payment_time
-                    filled_fields.append(purchase_time_col)
-                    changed_cells += 1
-
-                if filled_fields:
-                    report("info", f"订单 {order_id} 已补全: {', '.join(filled_fields)}")
                 else:
-                    report("warning", f"订单 {order_id} 已打开，但未识别到可填入的空白字段。")
-                report_progress(position, total)
+                    filled_fields: list[str] = []
+                    if item_col in df_out.columns and is_empty_value(df_out.at[index, item_col]) and info.item_name:
+                        df_out.at[index, item_col] = info.item_name
+                        filled_fields.append(item_col)
+                        changed_cells += 1
 
-    report("success", f"补全完成，共写入 {changed_cells} 个空白单元格。")
+                    if tracking_col in df_out.columns and is_empty_value(df_out.at[index, tracking_col]) and info.tracking_no:
+                        df_out.at[index, tracking_col] = info.tracking_no
+                        filled_fields.append(tracking_col)
+                        changed_cells += 1
+
+                    if arrival_col in df_out.columns and is_empty_value(df_out.at[index, arrival_col]) and info.arrival_time:
+                        df_out.at[index, arrival_col] = info.arrival_time
+                        filled_fields.append(arrival_col)
+                        changed_cells += 1
+
+                    if (
+                        purchase_time_col in df_out.columns
+                        and is_empty_value(df_out.at[index, purchase_time_col])
+                        and info.payment_time
+                    ):
+                        df_out.at[index, purchase_time_col] = info.payment_time
+                        filled_fields.append(purchase_time_col)
+                        changed_cells += 1
+
+                    if filled_fields:
+                        report("info", f"订单 {order_id} 已补全: {', '.join(filled_fields)}")
+                    else:
+                        report("warning", f"订单 {order_id} 已打开，但未识别到可填入的空白字段。")
+                    report_progress(position, total)
+
+                if position < total:
+                    report(
+                        "info",
+                        f"固定等待 {order_interval_seconds:g} 秒后再打开下一订单；期间不会点击页面元素。",
+                    )
+                    time.sleep(order_interval_seconds)
+
+    if stopped_for_access_limit:
+        report("warning", f"任务因访问限制提前停止，已写入 {changed_cells} 个空白单元格。")
+    else:
+        report("success", f"补全完成，共写入 {changed_cells} 个空白单元格。")
     return df_out
 
 
@@ -478,8 +555,10 @@ INDEX_HTML = """
           <div><label>快递单号列名</label><input type="text" name="tracking_col" value="快递单号"></div>
           <div><label>到达时间列名</label><input type="text" name="arrival_col" value="到达时间"></div>
           <div><label>购买时间列名（填入付款时间）</label><input type="text" name="purchase_time_col" value="购买时间"></div>
+                      <div><label>页面加载等待（秒，至少 10）</label><input type="number" name="page_wait_seconds" min="10" step="1" value="20"></div>
+                      <div><label>订单间固定等待（秒，至少 10）</label><input type="number" name="order_interval_seconds" min="10" step="1" value="20"></div>
         </div>
-        <div class="notice">开始前，请确认当前 Firefox 已登录淘宝/天猫且窗口可见。运行时请不要操作键盘或鼠标：程序会在同一 Firefox 窗口创建一个临时标签页，读取页面已渲染文字，完成后自动关闭该标签页。</div>
+                <div class="notice">开始前，请确认当前 Firefox 已登录淘宝/天猫且窗口可见。每个订单只执行：在临时标签页地址栏打开一次订单 URL → 固定等待 → 键盘复制一次已渲染正文。不会点击订单、物流、确认收货或任何页面按钮；不会轮询或重试同一个订单。若出现访问受限/操作频繁提示，任务会立即停止。</div>
         <button type="submit">开始补全并生成下载</button>
       </form>
       <footer>如果某个订单抓取失败，会保留原值；结果页日志会显示每个订单的成功、失败与实际写入列。</footer>
@@ -531,6 +610,19 @@ def _form_text(name: str, fallback: str) -> str:
     return (request.form.get(name) or "").strip() or fallback
 
 
+def _form_seconds(field_name: str, label: str, default: float, minimum: float) -> float:
+    raw_value = (request.form.get(field_name) or "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{label} 必须是数字。") from exc
+    if value < minimum:
+        raise ValueError(f"{label} 不能少于 {minimum:g} 秒。")
+    return value
+
+
 def _count_changed_cells(before: pd.DataFrame, after: pd.DataFrame) -> int:
     left = before.fillna("").astype(str)
     right = after.fillna("").astype(str)
@@ -568,6 +660,21 @@ def process_csv():
     tracking_col = _form_text("tracking_col", "快递单号")
     arrival_col = _form_text("arrival_col", "到达时间")
     purchase_time_col = _form_text("purchase_time_col", "购买时间")
+    try:
+        page_wait_seconds = _form_seconds(
+            "page_wait_seconds",
+            "页面加载等待",
+            DEFAULT_PAGE_WAIT_SECONDS,
+            MIN_PAGE_WAIT_SECONDS,
+        )
+        order_interval_seconds = _form_seconds(
+            "order_interval_seconds",
+            "订单间固定等待",
+            DEFAULT_ORDER_INTERVAL_SECONDS,
+            MIN_ORDER_INTERVAL_SECONDS,
+        )
+    except ValueError as exc:
+        return redirect(url_for("index", error=str(exc)))
 
     try:
         original = pd.read_csv(uploaded, dtype=str, keep_default_na=False)
@@ -596,6 +703,8 @@ def process_csv():
             tracking_col=tracking_col,
             arrival_col=arrival_col,
             purchase_time_col=purchase_time_col,
+            page_wait_seconds=page_wait_seconds,
+            order_interval_seconds=order_interval_seconds,
             status_cb=status_cb,
             progress_cb=progress_cb,
         )

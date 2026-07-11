@@ -15,6 +15,8 @@ def main() -> None:
     parser.add_argument("--tracking-col", default="快递单号")
     parser.add_argument("--arrival-col", default="到达时间")
     parser.add_argument("--purchase-time-col", default="购买时间")
+    parser.add_argument("--page-wait-seconds", type=float, default=20.0)
+    parser.add_argument("--order-interval-seconds", type=float, default=20.0)
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -36,6 +38,8 @@ def main() -> None:
         tracking_col=args.tracking_col,
         arrival_col=args.arrival_col,
         purchase_time_col=args.purchase_time_col,
+        page_wait_seconds=args.page_wait_seconds,
+        order_interval_seconds=args.order_interval_seconds,
         status_cb=status_cb,
         progress_cb=progress_cb,
     )
