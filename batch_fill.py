@@ -15,7 +15,6 @@ def main() -> None:
     parser.add_argument("--tracking-col", default="快递单号")
     parser.add_argument("--arrival-col", default="到达时间")
     parser.add_argument("--purchase-time-col", default="购买时间")
-    parser.add_argument("--profile-path", default="")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -37,7 +36,6 @@ def main() -> None:
         tracking_col=args.tracking_col,
         arrival_col=args.arrival_col,
         purchase_time_col=args.purchase_time_col,
-        profile_path=args.profile_path,
         status_cb=status_cb,
         progress_cb=progress_cb,
     )
