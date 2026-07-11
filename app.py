@@ -555,8 +555,8 @@ INDEX_HTML = """
           <div><label>快递单号列名</label><input type="text" name="tracking_col" value="快递单号"></div>
           <div><label>到达时间列名</label><input type="text" name="arrival_col" value="到达时间"></div>
           <div><label>购买时间列名（填入付款时间）</label><input type="text" name="purchase_time_col" value="购买时间"></div>
-                      <div><label>页面加载等待（秒，至少 10）</label><input type="number" name="page_wait_seconds" min="10" step="1" value="20"></div>
-                      <div><label>订单间固定等待（秒，至少 10）</label><input type="number" name="order_interval_seconds" min="10" step="1" value="20"></div>
+                      <div><label>页面加载等待（秒，至少 10）</label><input type="number" name="page_wait_seconds" min="0.5" step="0.5" value="20"></div>
+                      <div><label>订单间固定等待（秒，至少 10）</label><input type="number" name="order_interval_seconds" min="0.5" step="0.5" value="20"></div>
         </div>
                 <div class="notice">开始前，请确认当前 Firefox 已登录淘宝/天猫且窗口可见。每个订单只执行：在临时标签页地址栏打开一次订单 URL → 固定等待 → 键盘复制一次已渲染正文。不会点击订单、物流、确认收货或任何页面按钮；不会轮询或重试同一个订单。若出现访问受限/操作频繁提示，任务会立即停止。</div>
         <button type="submit">开始补全并生成下载</button>
