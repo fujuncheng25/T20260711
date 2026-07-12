@@ -78,6 +78,20 @@ body {
   margin-bottom: 14px;
 }
 
+.message-bar {
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.msg-list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.msg-list li {
+  margin: 4px 0;
+}
+
 .core-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -87,6 +101,11 @@ body {
 
 .core-card {
   margin-bottom: 0;
+}
+
+.camera-card,
+.reminder-card {
+  min-height: 220px;
 }
 
 h2,
@@ -109,6 +128,16 @@ h4 {
   display: grid;
   gap: 10px;
   margin-top: 10px;
+}
+
+.compact-form {
+  max-width: 300px;
+}
+
+.camera-form {
+  min-height: 160px;
+  display: grid;
+  place-items: center;
 }
 
 label {
@@ -150,9 +179,17 @@ button,
   color: var(--green-dark);
 }
 
-.big-button {
-  padding: 11px 14px;
-  font-size: 1rem;
+.camera-circle {
+  width: 112px;
+  height: 112px;
+  border-radius: 999px;
+  border: 2px solid var(--green-dark);
+  background: var(--green);
+  color: #fff;
+  font-size: 2rem;
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
 }
 
 .auth-card {
