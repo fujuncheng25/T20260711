@@ -1,404 +1,317 @@
 from __future__ import annotations
 
 import datetime as dt
+import hmac
 import os
-import random
 import re
+import secrets
+import shutil
+import sqlite3
 import threading
 import uuid
-from functools import wraps
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
-import pandas as pd
-from flask import Flask, flash, g, redirect, render_template, request, session, url_for
-from PIL import Image, ImageOps
-from sqlalchemy import (
-    Boolean,
-    DateTime,
-    ForeignKey,
-    Integer,
-    String,
-    Text,
-    UniqueConstraint,
-    create_engine,
-    desc,
-    func,
-    or_,
-    select,
+from flask import (
+    Flask,
+    abort,
+    flash,
+    g,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    send_from_directory,
+    session,
+    url_for,
 )
+from PIL import Image, ImageOps
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, create_engine, desc, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, scoped_session, sessionmaker
-from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 APP_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = APP_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+DB_PATH = Path(os.getenv("SQLITE_DB_PATH", str(APP_DIR / "logistics_alert.db"))).resolve()
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+DATABASE_URL = f"sqlite:///{DB_PATH.as_posix()}"
+
+DB_BACKUP_DIR = APP_DIR / "db_backups"
+MAX_DB_BACKUPS = 10
+SQLITE_HEADER = b"SQLite format 3\x00"
+
+PORT = int(os.getenv("PORT", "5000"))
+MAX_CONTENT_LENGTH_BYTES = 300 * 1024 * 1024
+
 UI_BUILD_ID = "20260711_200500_94731"
 UI_CSS_FILE = f"ui_{UI_BUILD_ID}.css"
 UI_JS_FILE = f"ui_{UI_BUILD_ID}.js"
 
-DEFAULT_NOTIFY_MESSAGE = "您的快递到了"
-EMPTY_VALUES = {"", "NAN", "NONE", "NULL", "/", "\\", "-"}
+DEFAULT_REMINDER_MESSAGE = "您的快递到了"
 ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+LOOPBACK_ADDRESSES = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
 ORDER_TOKEN_PATTERN = re.compile(r"[A-Z0-9]{8,32}")
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+psycopg2://postgres:postgres@127.0.0.1:5432/logistics_alert",
-)
-
-LOGISTICS_COLUMN_ALIASES = {
-    "category": ("类型",),
-    "item_desc": ("物品简述", "物品描述"),
-    "quantity": ("数量",),
-    "purchase_time": ("购买时间",),
-    "purchase_status": ("购买状态",),
-    "purchaser": ("购买人",),
-    "amount": ("金额",),
-    "payment_and_logistics_status": ("支付凭证+物流状态", "支付凭证物流状态"),
-    "arrival_time": ("到达时间",),
-    "order_no": ("订单号", "订单编号", "订单ID"),
-    "tracking_no": ("快递单号", "物流单号"),
-    "reimbursement_status": ("报销状态",),
+# OCR commonly confuses these glyphs on courier labels; keeping a mapped variant
+# improves suffix matching stability without requiring perfect full-string OCR.
+OCR_CONFUSION_MAP = {
+    "O": "0",
+    "D": "0",
+    "Q": "0",
+    "I": "1",
+    "L": "1",
+    "Z": "2",
+    "S": "5",
+    "B": "8",
 }
+
+_RAPID_OCR = None
+_RAPID_OCR_LOCK = threading.Lock()
+
+_EASY_OCR_READER = None
+_EASY_OCR_LOCK = threading.Lock()
 
 
 class Base(DeclarativeBase):
     pass
 
 
-class User(Base):
-    __tablename__ = "users"
+class ReminderRule(Base):
+    __tablename__ = "reminder_rules"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    username: Mapped[str] = mapped_column(String(60), unique=True, nullable=False, index=True)
-    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, nullable=False)
-
-    memberships: Mapped[list["GroupMember"]] = relationship(
-        back_populates="user",
-        cascade="all, delete-orphan",
-    )
-    created_groups: Mapped[list["UserGroup"]] = relationship(back_populates="owner")
-    created_reminders: Mapped[list["Reminder"]] = relationship(back_populates="creator")
-    notifications: Mapped[list["Notification"]] = relationship(
-        back_populates="user",
-        cascade="all, delete-orphan",
-    )
-
-
-class UserGroup(Base):
-    __tablename__ = "user_groups"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
-    created_by: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, nullable=False)
-
-    owner: Mapped[User] = relationship(back_populates="created_groups")
-    members: Mapped[list["GroupMember"]] = relationship(
-        back_populates="group",
-        cascade="all, delete-orphan",
-        lazy="selectin",
-    )
-    reminders: Mapped[list["Reminder"]] = relationship(
-        back_populates="group",
-        cascade="all, delete-orphan",
-        lazy="selectin",
-    )
-
-
-class GroupMember(Base):
-    __tablename__ = "group_members"
-    __table_args__ = (UniqueConstraint("group_id", "user_id", name="uq_group_member"),)
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    group_id: Mapped[int] = mapped_column(ForeignKey("user_groups.id"), nullable=False, index=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
-    role: Mapped[str] = mapped_column(String(20), default="member", nullable=False)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, nullable=False)
-
-    group: Mapped[UserGroup] = relationship(back_populates="members")
-    user: Mapped[User] = relationship(back_populates="memberships")
-
-
-class Reminder(Base):
-    __tablename__ = "reminders"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    group_id: Mapped[int] = mapped_column(ForeignKey("user_groups.id"), nullable=False, index=True)
-    created_by: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    watcher_name: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
     order_suffix: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    custom_message: Mapped[str] = mapped_column(String(240), default=DEFAULT_NOTIFY_MESSAGE, nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, nullable=False)
+    custom_message: Mapped[str] = mapped_column(String(240), nullable=False, default=DEFAULT_REMINDER_MESSAGE)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False, default=dt.datetime.utcnow)
 
-    group: Mapped[UserGroup] = relationship(back_populates="reminders")
-    creator: Mapped[User] = relationship(back_populates="created_reminders")
-
-
-class Parcel(Base):
-    __tablename__ = "parcels"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    category: Mapped[str] = mapped_column(String(50), default="", nullable=False)
-    item_desc: Mapped[str] = mapped_column(String(300), default="", nullable=False)
-    quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    purchase_time: Mapped[str] = mapped_column(String(80), default="", nullable=False)
-    purchase_status: Mapped[str] = mapped_column(String(80), default="", nullable=False)
-    purchaser: Mapped[str] = mapped_column(String(80), default="", nullable=False)
-    amount: Mapped[str] = mapped_column(String(40), default="", nullable=False)
-    payment_and_logistics_status: Mapped[str] = mapped_column(Text, default="", nullable=False)
-    arrival_time: Mapped[str] = mapped_column(String(80), default="", nullable=False)
-    order_no: Mapped[str] = mapped_column(String(80), unique=True, nullable=False, index=True)
-    tracking_no: Mapped[str] = mapped_column(String(80), default="", nullable=False)
-    reimbursement_status: Mapped[str] = mapped_column(String(80), default="", nullable=False)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, nullable=False)
-    updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime,
-        default=dt.datetime.utcnow,
-        onupdate=dt.datetime.utcnow,
-        nullable=False,
-    )
+    notifications: Mapped[list["Notification"]] = relationship(back_populates="reminder")
 
 
-class PickupEvent(Base):
-    __tablename__ = "pickup_events"
+class PickupLog(Base):
+    __tablename__ = "pickup_logs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    scanner_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
-    image_path: Mapped[str] = mapped_column(String(260), nullable=False)
-    extracted_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
-    detected_order_no: Mapped[str] = mapped_column(String(80), default="", nullable=False)
-    shown_group_id: Mapped[int | None] = mapped_column(ForeignKey("user_groups.id"), nullable=True)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, nullable=False)
+    uploader_name: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    image_filename: Mapped[str] = mapped_column(String(260), nullable=False)
+    extracted_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    recognized_order_no: Mapped[str] = mapped_column(String(80), nullable=False, default="")
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False, default=dt.datetime.utcnow, index=True)
+
+    notifications: Mapped[list["Notification"]] = relationship(back_populates="pickup_log")
 
 
 class Notification(Base):
     __tablename__ = "notifications"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
-    group_id: Mapped[int] = mapped_column(ForeignKey("user_groups.id"), nullable=False, index=True)
-    reminder_id: Mapped[int] = mapped_column(ForeignKey("reminders.id"), nullable=False, index=True)
-    pickup_event_id: Mapped[int] = mapped_column(ForeignKey("pickup_events.id"), nullable=False, index=True)
+    reminder_id: Mapped[int] = mapped_column(ForeignKey("reminder_rules.id"), nullable=False, index=True)
+    pickup_log_id: Mapped[int] = mapped_column(ForeignKey("pickup_logs.id"), nullable=False, index=True)
+    watcher_name: Mapped[str] = mapped_column(String(80), nullable=False)
     title: Mapped[str] = mapped_column(String(120), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
-    is_read: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, nullable=False)
+    matched_order_no: Mapped[str] = mapped_column(String(80), nullable=False)
+    order_suffix: Mapped[str] = mapped_column(String(32), nullable=False)
+    uploader_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    image_filename: Mapped[str] = mapped_column(String(260), nullable=False)
+    is_read: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False, default=dt.datetime.utcnow)
 
-    user: Mapped[User] = relationship(back_populates="notifications")
+    reminder: Mapped[ReminderRule] = relationship(back_populates="notifications")
+    pickup_log: Mapped[PickupLog] = relationship(back_populates="notifications")
 
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+engine = create_engine(
+    DATABASE_URL,
+    future=True,
+    pool_pre_ping=True,
+    connect_args={"check_same_thread": False},
+)
 SessionFactory = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 SessionLocal = scoped_session(SessionFactory)
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "change-me-before-production")
-app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH_BYTES
 
 
 def init_db() -> None:
     Base.metadata.create_all(engine)
 
 
+@app.context_processor
+def inject_template_context() -> dict[str, object]:
+    is_super_admin = False
+    if request:
+        is_super_admin = is_loopback_request()
+    return {
+        "ui_build_id": UI_BUILD_ID,
+        "ui_css_file": UI_CSS_FILE,
+        "ui_js_file": UI_JS_FILE,
+        "is_super_admin": is_super_admin,
+    }
+
+
 def clean_text(value: object) -> str:
     if value is None:
         return ""
-    text = str(value).strip()
-    if text.upper() in EMPTY_VALUES:
-        return ""
-    return text
+    return str(value).strip()
 
 
 def normalize_token(value: object) -> str:
     return re.sub(r"[^A-Z0-9]", "", clean_text(value).upper())
 
 
-def parse_quantity(value: object) -> int | None:
-    text = clean_text(value)
-    if not text:
-        return None
-    try:
-        return int(float(text))
-    except ValueError:
-        return None
+def digits_only(value: str) -> str:
+    return "".join(char for char in value if char.isdigit())
 
 
-def pick_first_value(row: pd.Series, aliases: Iterable[str]) -> str:
-    for alias in aliases:
-        if alias in row.index:
-            value = clean_text(row.get(alias, ""))
-            if value:
-                return value
-    return ""
-
-
-def load_table_from_upload(uploaded_file) -> pd.DataFrame:
-    filename = (uploaded_file.filename or "").lower()
-    if filename.endswith(".csv"):
-        return pd.read_csv(uploaded_file, dtype=str, keep_default_na=False)
-    if filename.endswith(".xlsx") or filename.endswith(".xls"):
-        return pd.read_excel(uploaded_file, dtype=str, keep_default_na=False)
-    raise ValueError("只支持 CSV/XLS/XLSX 文件。")
-
-
-def load_table_from_path(path: Path) -> pd.DataFrame:
-    suffix = path.suffix.lower()
-    if suffix == ".csv":
-        return pd.read_csv(path, dtype=str, keep_default_na=False)
-    if suffix in {".xlsx", ".xls"}:
-        return pd.read_excel(path, dtype=str, keep_default_na=False)
-    raise ValueError("输入文件必须是 CSV/XLS/XLSX。")
-
-
-def import_parcel_dataframe(db_session, df: pd.DataFrame) -> tuple[int, int, int]:
-    parsed_rows: list[dict[str, object]] = []
-    skipped = 0
-
-    for _, row in df.iterrows():
-        order_no = normalize_token(pick_first_value(row, LOGISTICS_COLUMN_ALIASES["order_no"]))
-        if not order_no:
-            skipped += 1
+def merge_unique_lines(lines: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    merged: list[str] = []
+    for raw_line in lines:
+        text = clean_text(raw_line)
+        if not text or text in seen:
             continue
-
-        parsed_rows.append(
-            {
-                "category": pick_first_value(row, LOGISTICS_COLUMN_ALIASES["category"]),
-                "item_desc": pick_first_value(row, LOGISTICS_COLUMN_ALIASES["item_desc"]),
-                "quantity": parse_quantity(pick_first_value(row, LOGISTICS_COLUMN_ALIASES["quantity"])),
-                "purchase_time": pick_first_value(row, LOGISTICS_COLUMN_ALIASES["purchase_time"]),
-                "purchase_status": pick_first_value(row, LOGISTICS_COLUMN_ALIASES["purchase_status"]),
-                "purchaser": pick_first_value(row, LOGISTICS_COLUMN_ALIASES["purchaser"]),
-                "amount": pick_first_value(row, LOGISTICS_COLUMN_ALIASES["amount"]),
-                "payment_and_logistics_status": pick_first_value(
-                    row,
-                    LOGISTICS_COLUMN_ALIASES["payment_and_logistics_status"],
-                ),
-                "arrival_time": pick_first_value(row, LOGISTICS_COLUMN_ALIASES["arrival_time"]),
-                "order_no": order_no,
-                "tracking_no": normalize_token(pick_first_value(row, LOGISTICS_COLUMN_ALIASES["tracking_no"])),
-                "reimbursement_status": pick_first_value(row, LOGISTICS_COLUMN_ALIASES["reimbursement_status"]),
-            }
-        )
-
-    if not parsed_rows:
-        return 0, 0, skipped
-
-    order_nos = [item["order_no"] for item in parsed_rows]
-    existing = db_session.scalars(select(Parcel).where(Parcel.order_no.in_(order_nos))).all()
-    existing_by_order = {item.order_no: item for item in existing}
-
-    inserted = 0
-    updated = 0
-
-    for payload in parsed_rows:
-        order_no = str(payload["order_no"])
-        current = existing_by_order.get(order_no)
-        if current is None:
-            db_session.add(Parcel(**payload))
-            inserted += 1
-            continue
-
-        for field_name, field_value in payload.items():
-            setattr(current, field_name, field_value)
-        updated += 1
-
-    return inserted, updated, skipped
+        seen.add(text)
+        merged.append(text)
+    return merged
 
 
-def decode_barcodes(image: np.ndarray) -> list[str]:
-    try:
-        import zxingcpp
-    except Exception:
-        return []
-
-    values: list[str] = []
-    try:
-        results = zxingcpp.read_barcodes(image)
-    except Exception:
-        return []
-
-    for result in results:
-        text = clean_text(getattr(result, "text", ""))
-        if text:
-            values.append(text)
-    return list(dict.fromkeys(values))
-
-
-_OCR_READER = None
-_OCR_READER_LOCK = threading.Lock()
-
-
-def _get_ocr_reader():
-    """Lazily build a PyTorch-backed OCR reader (EasyOCR).
-
-    This intentionally avoids any external OS executable (e.g. the Tesseract
-    binary): the model weights are plain data files downloaded once via pip's
-    own cache/model-download machinery and executed in-process through
-    PyTorch, so this keeps working unchanged if the app is dropped into a
-    fresh Linux container.
-    """
-    global _OCR_READER
-    if _OCR_READER is not None:
-        return _OCR_READER
-
-    with _OCR_READER_LOCK:
-        if _OCR_READER is None:
-            import easyocr
-            import torch
-
-            _OCR_READER = easyocr.Reader(
-                ["ch_sim", "en"],
-                gpu=torch.cuda.is_available(),
-                verbose=False,
-            )
-    return _OCR_READER
-
-
-def decode_ocr_lines(image: Image.Image) -> list[str]:
-    try:
-        reader = _get_ocr_reader()
-    except Exception:
-        return []
-
-    # Grayscale + autocontrast increases OCR robustness for courier labels.
-    prepared = ImageOps.autocontrast(ImageOps.grayscale(image))
-
-    try:
-        results = reader.readtext(np.array(prepared), detail=1, paragraph=False)
-    except Exception:
-        return []
-
-    lines: list[str] = []
-    for entry in results:
-        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
-            continue
-        text = clean_text(entry[1])
-        if text:
-            lines.append(text)
-    return lines
+def token_variants(token: str) -> list[str]:
+    mapped = "".join(OCR_CONFUSION_MAP.get(char, char) for char in token)
+    if mapped != token:
+        return [token, mapped]
+    return [token]
 
 
 def extract_order_candidates(recognized_parts: Iterable[str]) -> list[str]:
     candidates: dict[str, bool] = {}
     for part in recognized_parts:
-        text = clean_text(part).upper()
-        if not text:
+        normalized_part = clean_text(part).upper()
+        if not normalized_part:
             continue
-        for token in ORDER_TOKEN_PATTERN.findall(text):
-            normalized = normalize_token(token)
-            if len(normalized) < 8:
-                continue
-            digit_count = sum(char.isdigit() for char in normalized)
-            if digit_count < 6:
-                continue
-            candidates[normalized] = True
+        for token in ORDER_TOKEN_PATTERN.findall(normalized_part):
+            base = normalize_token(token)
+            for variant in token_variants(base):
+                if len(variant) < 8:
+                    continue
+                if sum(char.isdigit() for char in variant) < 6:
+                    continue
+                candidates[variant] = True
     return sorted(candidates.keys(), key=lambda item: (-len(item), item))
+
+
+def suffix_matches(candidate: str, suffix: str) -> bool:
+    if candidate.endswith(suffix):
+        return True
+
+    suffix_digits = digits_only(suffix)
+    if len(suffix_digits) < 4:
+        return False
+    return digits_only(candidate).endswith(suffix_digits)
+
+
+def is_loopback_request() -> bool:
+    """Allow admin actions only from the same machine (127.0.0.1/::1)."""
+    remote_addr = (request.remote_addr or "").strip()
+    return remote_addr in LOOPBACK_ADDRESSES or remote_addr.startswith("127.")
+
+
+def get_rapid_ocr():
+    global _RAPID_OCR
+    if _RAPID_OCR is not None:
+        return _RAPID_OCR
+
+    with _RAPID_OCR_LOCK:
+        if _RAPID_OCR is None:
+            from rapidocr_onnxruntime import RapidOCR
+
+            _RAPID_OCR = RapidOCR()
+    return _RAPID_OCR
+
+
+def decode_rapidocr_lines(np_image: np.ndarray) -> list[str]:
+    try:
+        reader = get_rapid_ocr()
+    except Exception:
+        return []
+
+    try:
+        results, _ = reader(np_image)
+    except Exception:
+        return []
+
+    lines: list[str] = []
+    for row in results or []:
+        if not isinstance(row, (list, tuple)):
+            continue
+        text = clean_text(row[1] if len(row) > 1 else "")
+        if text:
+            lines.append(text)
+    return lines
+
+
+def get_easyocr_reader():
+    global _EASY_OCR_READER
+    if _EASY_OCR_READER is not None:
+        return _EASY_OCR_READER
+
+    with _EASY_OCR_LOCK:
+        if _EASY_OCR_READER is None:
+            import easyocr
+            import torch
+
+            _EASY_OCR_READER = easyocr.Reader(
+                ["ch_sim", "en"],
+                gpu=torch.cuda.is_available(),
+                verbose=False,
+            )
+    return _EASY_OCR_READER
+
+
+def decode_easyocr_lines(np_image: np.ndarray) -> list[str]:
+    try:
+        reader = get_easyocr_reader()
+    except Exception:
+        return []
+
+    try:
+        results = reader.readtext(np_image, detail=1, paragraph=False)
+    except Exception:
+        return []
+
+    lines: list[str] = []
+    for row in results:
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            continue
+        text = clean_text(row[1])
+        if text:
+            lines.append(text)
+    return lines
+
+
+def decode_barcodes(np_image: np.ndarray) -> list[str]:
+    try:
+        import zxingcpp
+    except Exception:
+        return []
+
+    try:
+        rows = zxingcpp.read_barcodes(np_image)
+    except Exception:
+        return []
+
+    lines: list[str] = []
+    for row in rows:
+        text = clean_text(getattr(row, "text", ""))
+        if text:
+            lines.append(text)
+    return lines
 
 
 def analyze_pickup_image(image_path: Path) -> tuple[list[str], list[str], list[str], str]:
@@ -407,109 +320,55 @@ def analyze_pickup_image(image_path: Path) -> tuple[list[str], list[str], list[s
     except Exception as exc:
         raise ValueError("图片解析失败，请上传清晰的 JPG/PNG 图片。") from exc
 
-    barcode_values = decode_barcodes(np.array(image))
-    ocr_lines = decode_ocr_lines(image)
-    recognized_parts = barcode_values + ocr_lines
+    rgb_array = np.array(image)
+    gray_array = np.array(ImageOps.autocontrast(ImageOps.grayscale(image)))
+
+    barcode_lines = decode_barcodes(rgb_array)
+    rapidocr_lines = decode_rapidocr_lines(gray_array)
+    easyocr_lines = decode_easyocr_lines(gray_array)
+
+    ocr_lines = merge_unique_lines(rapidocr_lines + easyocr_lines)
+    recognized_parts = merge_unique_lines(barcode_lines + ocr_lines)
     candidates = extract_order_candidates(recognized_parts)
     extracted_text = "\n".join(recognized_parts)
-    return candidates, barcode_values, ocr_lines, extracted_text
+    return candidates, barcode_lines, ocr_lines, extracted_text
 
 
-def match_reminders(candidates: list[str], reminders: list[Reminder]) -> list[tuple[str, Reminder]]:
-    matched: list[tuple[str, Reminder]] = []
-    for candidate in candidates:
-        for reminder in reminders:
-            if candidate.endswith(reminder.order_suffix):
-                matched.append((candidate, reminder))
-    return matched
+def is_valid_sqlite_file(path: Path) -> bool:
+    try:
+        with open(path, "rb") as file_obj:
+            if file_obj.read(len(SQLITE_HEADER)) != SQLITE_HEADER:
+                return False
+
+        conn = sqlite3.connect(str(path))
+        try:
+            result = conn.execute("PRAGMA integrity_check").fetchone()
+            return bool(result) and str(result[0]).lower() == "ok"
+        finally:
+            conn.close()
+    except Exception:
+        return False
 
 
-def create_notifications_for_matches(
-    db_session,
-    scanner: User,
-    pickup_event: PickupEvent,
-    matches: list[tuple[str, Reminder]],
-) -> int:
-    chosen_by_reminder: dict[int, tuple[str, Reminder]] = {}
-    for candidate, reminder in matches:
-        chosen_by_reminder.setdefault(reminder.id, (candidate, reminder))
+def create_db_backup() -> Path | None:
+    if not DB_PATH.exists():
+        return None
 
-    created = 0
-    for candidate, reminder in chosen_by_reminder.values():
-        custom_message = clean_text(reminder.custom_message) or DEFAULT_NOTIFY_MESSAGE
-        member_rows = db_session.scalars(
-            select(GroupMember).where(GroupMember.group_id == reminder.group_id)
-        ).all()
+    DB_BACKUP_DIR.mkdir(exist_ok=True)
+    backup_name = f"{DB_PATH.stem}_{dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.db"
+    backup_path = DB_BACKUP_DIR / backup_name
+    shutil.copy2(DB_PATH, backup_path)
 
-        for member in member_rows:
-            title = f"{reminder.group.name} 取件通知"
-            body = (
-                f"{custom_message}\n"
-                f"命中尾号: {reminder.order_suffix}\n"
-                f"识别单号: {candidate}\n"
-                f"取件人: {scanner.username}"
-            )
-            db_session.add(
-                Notification(
-                    user_id=member.user_id,
-                    group_id=reminder.group_id,
-                    reminder_id=reminder.id,
-                    pickup_event_id=pickup_event.id,
-                    title=title,
-                    body=body,
-                )
-            )
-            created += 1
-    return created
-
-
-def get_user_groups(db_session, user_id: int) -> list[UserGroup]:
-    stmt = (
-        select(UserGroup)
-        .join(GroupMember, GroupMember.group_id == UserGroup.id)
-        .where(GroupMember.user_id == user_id)
-        .order_by(desc(UserGroup.created_at))
-    )
-    return db_session.scalars(stmt).unique().all()
-
-
-def get_membership(db_session, group_id: int, user_id: int) -> GroupMember | None:
-    return db_session.scalar(
-        select(GroupMember).where(
-            GroupMember.group_id == group_id,
-            GroupMember.user_id == user_id,
-        )
-    )
-
-
-def login_required(view_func):
-    @wraps(view_func)
-    def wrapper(*args, **kwargs):
-        if g.current_user is None:
-            flash("请先登录。", "warning")
-            return redirect(url_for("login"))
-        return view_func(*args, **kwargs)
-
-    return wrapper
-
-
-@app.context_processor
-def inject_template_globals():
-    return {
-        "current_user": getattr(g, "current_user", None),
-        "ui_build_id": UI_BUILD_ID,
-        "ui_css_file": UI_CSS_FILE,
-        "ui_js_file": UI_JS_FILE,
-    }
+    backups = sorted(DB_BACKUP_DIR.glob(f"{DB_PATH.stem}_*.db"))
+    while len(backups) > MAX_DB_BACKUPS:
+        oldest = backups.pop(0)
+        oldest.unlink(missing_ok=True)
+    return backup_path
 
 
 @app.before_request
 def open_db_session():
     g.db = SessionLocal()
-    g.current_user = None
-    user_id = session.get("user_id")
-    if user_id:
-        g.current_user = g.db.get(User, user_id)
 
 
 @app.teardown_request
@@ -527,394 +386,268 @@ def close_db_session(error):
 
 
 @app.get("/")
-def home():
-    if g.current_user:
-        return redirect(url_for("dashboard"))
-    return redirect(url_for("login"))
-
-
-@app.route("/register", methods=["GET", "POST"])
-def register():
-    if g.current_user:
-        return redirect(url_for("dashboard"))
-
-    if request.method == "POST":
-        username = clean_text(request.form.get("username"))
-        password = request.form.get("password", "")
-        password_confirm = request.form.get("password_confirm", "")
-        db_session = g.db
-
-        if len(username) < 3:
-            flash("用户名至少 3 个字符。", "danger")
-            return render_template("register.html")
-        if len(password) < 6:
-            flash("密码至少 6 个字符。", "danger")
-            return render_template("register.html")
-        if password != password_confirm:
-            flash("两次密码输入不一致。", "danger")
-            return render_template("register.html")
-        if db_session.scalar(select(User).where(User.username == username)):
-            flash("用户名已存在，请换一个。", "danger")
-            return render_template("register.html")
-
-        db_session.add(User(username=username, password_hash=generate_password_hash(password)))
-        db_session.commit()
-        flash("注册成功，请登录。", "success")
-        return redirect(url_for("login"))
-
-    return render_template("register.html")
-
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if g.current_user:
-        return redirect(url_for("dashboard"))
-
-    if request.method == "POST":
-        username = clean_text(request.form.get("username"))
-        password = request.form.get("password", "")
-        db_session = g.db
-        user = db_session.scalar(select(User).where(User.username == username))
-
-        if user is None or not check_password_hash(user.password_hash, password):
-            flash("用户名或密码错误。", "danger")
-            return render_template("login.html")
-
-        session["user_id"] = user.id
-        flash("登录成功。", "success")
-        return redirect(url_for("dashboard"))
-
-    return render_template("login.html")
-
-
-@app.get("/logout")
-def logout():
-    session.clear()
-    flash("已退出登录。", "info")
-    return redirect(url_for("login"))
-
-
-@app.get("/dashboard")
-@login_required
-def dashboard():
+def index():
     db_session = g.db
-    user = g.current_user
-    groups = get_user_groups(db_session, user.id)
-    group_ids = [group.id for group in groups]
 
-    unread_count = db_session.scalar(
-        select(func.count(Notification.id)).where(
-            Notification.user_id == user.id,
-            Notification.is_read.is_(False),
-        )
-    ) or 0
-
-    recent_notifications = db_session.scalars(
-        select(Notification)
-        .where(Notification.user_id == user.id)
-        .order_by(desc(Notification.created_at))
-        .limit(8)
+    reminders = db_session.scalars(
+        select(ReminderRule).order_by(desc(ReminderRule.created_at)).limit(300)
+    ).all()
+    notifications = db_session.scalars(
+        select(Notification).order_by(desc(Notification.created_at)).limit(300)
     ).all()
 
-    parcel_count = db_session.scalar(select(func.count(Parcel.id))) or 0
-    active_reminders = 0
-    if group_ids:
-        active_reminders = db_session.scalar(
-            select(func.count(Reminder.id)).where(
-                Reminder.group_id.in_(group_ids),
-                Reminder.is_active.is_(True),
-            )
-        ) or 0
+    today = dt.date.today()
+    start = dt.datetime.combine(today, dt.time.min)
+    end = start + dt.timedelta(days=1)
+    today_logs = db_session.scalars(
+        select(PickupLog)
+        .where(PickupLog.created_at >= start, PickupLog.created_at < end)
+        .order_by(desc(PickupLog.created_at))
+    ).all()
 
     return render_template(
-        "dashboard.html",
-        groups=groups,
-        parcel_count=parcel_count,
-        active_reminders=active_reminders,
-        unread_count=unread_count,
-        recent_notifications=recent_notifications,
-        default_notify_message=DEFAULT_NOTIFY_MESSAGE,
+        "index.html",
+        reminders=reminders,
+        notifications=notifications,
+        today_logs=today_logs,
+        today=today,
+        can_admin=is_loopback_request(),
+        default_reminder_message=DEFAULT_REMINDER_MESSAGE,
     )
 
 
-@app.post("/import-logistics")
-@login_required
-def import_logistics():
-    uploaded = request.files.get("sheet_file")
-    if not uploaded or not uploaded.filename:
-        flash("请先上传物流表（CSV/XLS/XLSX）。", "danger")
-        return redirect(url_for("dashboard"))
+@app.post("/reminders/create")
+def create_reminder():
+    watcher_name = clean_text(request.form.get("watcher_name"))
+    order_suffix = normalize_token(request.form.get("order_suffix"))
+    custom_message = clean_text(request.form.get("custom_message")) or DEFAULT_REMINDER_MESSAGE
 
-    try:
-        df = load_table_from_upload(uploaded)
-    except Exception as exc:
-        flash(f"文件读取失败：{exc}", "danger")
-        return redirect(url_for("dashboard"))
-
-    db_session = g.db
-    try:
-        inserted, updated, skipped = import_parcel_dataframe(db_session, df)
-        db_session.commit()
-    except Exception as exc:
-        db_session.rollback()
-        flash(f"导入失败：{exc}", "danger")
-        return redirect(url_for("dashboard"))
-
-    flash(
-        f"导入完成：新增 {inserted} 条，更新 {updated} 条，跳过 {skipped} 条（无订单号）。",
-        "success",
-    )
-    return redirect(url_for("dashboard"))
-
-
-@app.post("/groups/create")
-@login_required
-def create_group():
-    group_name = clean_text(request.form.get("group_name"))
-    if not group_name:
-        flash("组名不能为空。", "danger")
-        return redirect(url_for("dashboard"))
+    if len(watcher_name) < 1:
+        flash("提醒接收人不能为空。", "danger")
+        return redirect(url_for("index"))
+    if len(order_suffix) < 4:
+        flash("快递尾号至少输入 4 位。", "danger")
+        return redirect(url_for("index"))
 
     db_session = g.db
-    group = UserGroup(name=group_name, created_by=g.current_user.id)
-    db_session.add(group)
-    db_session.flush()
-    db_session.add(GroupMember(group_id=group.id, user_id=g.current_user.id, role="owner"))
-    db_session.commit()
-
-    flash(f"已创建用户组：{group_name}", "success")
-    return redirect(url_for("dashboard"))
-
-
-@app.post("/groups/<int:group_id>/members/add")
-@login_required
-def add_group_member(group_id: int):
-    db_session = g.db
-    membership = get_membership(db_session, group_id, g.current_user.id)
-    if membership is None or membership.role != "owner":
-        flash("只有组主可以添加成员。", "danger")
-        return redirect(url_for("dashboard"))
-
-    username = clean_text(request.form.get("username"))
-    if not username:
-        flash("成员用户名不能为空。", "danger")
-        return redirect(url_for("dashboard"))
-
-    user_to_add = db_session.scalar(select(User).where(User.username == username))
-    if user_to_add is None:
-        flash("找不到这个用户，请先注册账号。", "danger")
-        return redirect(url_for("dashboard"))
-
-    if get_membership(db_session, group_id, user_to_add.id):
-        flash("该用户已经在组里了。", "info")
-        return redirect(url_for("dashboard"))
-
-    db_session.add(GroupMember(group_id=group_id, user_id=user_to_add.id, role="member"))
-    db_session.commit()
-    flash(f"已添加成员：{username}", "success")
-    return redirect(url_for("dashboard"))
-
-
-@app.post("/groups/<int:group_id>/reminders/create")
-@login_required
-def create_reminder(group_id: int):
-    db_session = g.db
-    membership = get_membership(db_session, group_id, g.current_user.id)
-    if membership is None:
-        flash("你不是该组成员，不能设置提醒。", "danger")
-        return redirect(url_for("dashboard"))
-
-    suffix = normalize_token(request.form.get("order_suffix"))
-    custom_message = clean_text(request.form.get("custom_message")) or DEFAULT_NOTIFY_MESSAGE
-
-    if len(suffix) < 4:
-        flash("订单尾号至少输入 4 位。", "danger")
-        return redirect(url_for("dashboard"))
-
     db_session.add(
-        Reminder(
-            group_id=group_id,
-            created_by=g.current_user.id,
-            order_suffix=suffix,
+        ReminderRule(
+            watcher_name=watcher_name,
+            order_suffix=order_suffix,
             custom_message=custom_message,
             is_active=True,
         )
     )
     db_session.commit()
-    flash(f"提醒已创建：尾号 {suffix}", "success")
-    return redirect(url_for("dashboard"))
+    flash(f"提醒已创建：{watcher_name} / 尾号 {order_suffix}", "success")
+    return redirect(url_for("index"))
 
 
 @app.post("/reminders/<int:reminder_id>/toggle")
-@login_required
 def toggle_reminder(reminder_id: int):
     db_session = g.db
-    reminder = db_session.get(Reminder, reminder_id)
+    reminder = db_session.get(ReminderRule, reminder_id)
     if reminder is None:
         flash("提醒不存在。", "danger")
-        return redirect(url_for("dashboard"))
-
-    membership = get_membership(db_session, reminder.group_id, g.current_user.id)
-    if membership is None:
-        flash("你不是该组成员，不能修改提醒。", "danger")
-        return redirect(url_for("dashboard"))
+        return redirect(url_for("index"))
 
     reminder.is_active = not reminder.is_active
     db_session.commit()
-    status_text = "启用" if reminder.is_active else "停用"
-    flash(f"提醒已{status_text}：尾号 {reminder.order_suffix}", "success")
-    return redirect(url_for("dashboard"))
+    state_text = "启用" if reminder.is_active else "停用"
+    flash(f"提醒已{state_text}：{reminder.watcher_name} / 尾号 {reminder.order_suffix}", "info")
+    return redirect(url_for("index"))
 
 
-@app.route("/scan", methods=["GET", "POST"])
-@login_required
-def scan():
-    scan_result = None
-    if request.method == "POST":
-        uploaded_image = request.files.get("pickup_image")
-        if not uploaded_image or not uploaded_image.filename:
-            flash("请上传拍照图片。", "danger")
-            return redirect(url_for("scan"))
+@app.post("/scan")
+def scan_and_record():
+    uploader_name = clean_text(request.form.get("uploader_name"))
+    uploaded = request.files.get("pickup_image")
 
-        suffix = Path(uploaded_image.filename).suffix.lower()
-        if suffix not in ALLOWED_IMAGE_SUFFIXES:
-            flash("图片格式不支持，请上传 JPG/PNG/WEBP/BMP/TIF。", "danger")
-            return redirect(url_for("scan"))
+    if len(uploader_name) < 1:
+        flash("请填写拍照上传人。", "danger")
+        return redirect(url_for("index"))
+    if not uploaded or not uploaded.filename:
+        flash("请上传图片文件。", "danger")
+        return redirect(url_for("index"))
 
-        unique_name = (
-            f"{dt.datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
-            f"_{uuid.uuid4().hex[:8]}_{secure_filename(uploaded_image.filename)}"
-        )
-        target_path = UPLOAD_DIR / unique_name
-        uploaded_image.save(target_path)
+    suffix = Path(uploaded.filename).suffix.lower()
+    if suffix not in ALLOWED_IMAGE_SUFFIXES:
+        flash("图片格式不支持，请上传 JPG/PNG/WEBP/BMP/TIF。", "danger")
+        return redirect(url_for("index"))
 
-        try:
-            candidates, barcode_values, ocr_lines, extracted_text = analyze_pickup_image(target_path)
-        except Exception as exc:
-            flash(f"识别失败：{exc}", "danger")
-            return redirect(url_for("scan"))
+    unique_filename = (
+        f"{dt.datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}_"
+        f"{secure_filename(uploaded.filename)}"
+    )
+    image_path = UPLOAD_DIR / unique_filename
+    uploaded.save(image_path)
 
-        db_session = g.db
-        reminders = db_session.scalars(
-            select(Reminder).where(Reminder.is_active.is_(True)).order_by(Reminder.created_at.asc())
-        ).all()
-        matches = match_reminders(candidates, reminders)
+    try:
+        candidates, barcode_lines, ocr_lines, extracted_text = analyze_pickup_image(image_path)
+    except Exception as exc:
+        image_path.unlink(missing_ok=True)
+        flash(f"OCR 识别失败：{exc}", "danger")
+        return redirect(url_for("index"))
 
-        matched_groups: dict[int, UserGroup] = {}
-        for _, reminder in matches:
-            matched_groups[reminder.group_id] = reminder.group
-        shown_group = random.choice(list(matched_groups.values())) if matched_groups else None
-
-        pickup_event = PickupEvent(
-            scanner_user_id=g.current_user.id,
-            image_path=str(target_path.relative_to(APP_DIR)),
-            extracted_text=extracted_text,
-            detected_order_no=candidates[0] if candidates else "",
-            shown_group_id=shown_group.id if shown_group else None,
-        )
-        db_session.add(pickup_event)
-        db_session.flush()
-
-        notifications_created = create_notifications_for_matches(
-            db_session=db_session,
-            scanner=g.current_user,
-            pickup_event=pickup_event,
-            matches=matches,
-        )
-        db_session.commit()
-
-        row_by_reminder: dict[int, dict[str, object]] = {}
-        for candidate, reminder in matches:
-            if reminder.id not in row_by_reminder:
-                member_count = db_session.scalar(
-                    select(func.count(GroupMember.id)).where(GroupMember.group_id == reminder.group_id)
-                ) or 0
-                row_by_reminder[reminder.id] = {
-                    "group_name": reminder.group.name,
-                    "suffix": reminder.order_suffix,
-                    "candidate": candidate,
-                    "message": reminder.custom_message,
-                    "member_count": member_count,
-                }
-
-        scan_result = {
-            "barcode_values": barcode_values,
-            "ocr_lines": ocr_lines,
-            "candidates": candidates,
-            "shown_group": shown_group.name if shown_group else "未匹配到组别",
-            "notifications_created": notifications_created,
-            "match_rows": list(row_by_reminder.values()),
-        }
-
-    return render_template("scan.html", scan_result=scan_result)
-
-
-@app.get("/notifications")
-@login_required
-def notifications():
     db_session = g.db
-    rows = db_session.scalars(
-        select(Notification)
-        .where(Notification.user_id == g.current_user.id)
-        .order_by(desc(Notification.created_at))
-        .limit(300)
+    pickup_log = PickupLog(
+        uploader_name=uploader_name,
+        image_filename=unique_filename,
+        extracted_text=extracted_text,
+        recognized_order_no=(candidates[0] if candidates else ""),
+    )
+    db_session.add(pickup_log)
+    db_session.flush()
+
+    reminder_rules = db_session.scalars(
+        select(ReminderRule).where(ReminderRule.is_active.is_(True)).order_by(ReminderRule.created_at.asc())
     ).all()
-    return render_template("notifications.html", notifications=rows)
 
+    reminder_count = 0
+    for rule in reminder_rules:
+        matched_candidate = next((candidate for candidate in candidates if suffix_matches(candidate, rule.order_suffix)), None)
+        if not matched_candidate:
+            continue
 
-@app.post("/notifications/read-all")
-@login_required
-def read_all_notifications():
-    db_session = g.db
-    unread_rows = db_session.scalars(
-        select(Notification).where(
-            Notification.user_id == g.current_user.id,
-            Notification.is_read.is_(False),
+        title = f"{rule.watcher_name} 的快递提醒"
+        custom_message = clean_text(rule.custom_message) or DEFAULT_REMINDER_MESSAGE
+        body = (
+            f"{custom_message}\n"
+            f"拍照人: {uploader_name}\n"
+            f"命中尾号: {rule.order_suffix}\n"
+            f"识别单号: {matched_candidate}"
         )
-    ).all()
-    for row in unread_rows:
-        row.is_read = True
-    db_session.commit()
-    flash("已标记全部通知为已读。", "success")
-    return redirect(url_for("notifications"))
-
-
-@app.get("/parcels")
-@login_required
-def parcels():
-    db_session = g.db
-    keyword = clean_text(request.args.get("q", ""))
-    query = select(Parcel).order_by(desc(Parcel.updated_at), desc(Parcel.created_at))
-    if keyword:
-        like_term = f"%{keyword.upper()}%"
-        query = query.where(
-            or_(
-                func.upper(Parcel.order_no).like(like_term),
-                func.upper(Parcel.tracking_no).like(like_term),
-                func.upper(Parcel.item_desc).like(like_term),
+        db_session.add(
+            Notification(
+                reminder_id=rule.id,
+                pickup_log_id=pickup_log.id,
+                watcher_name=rule.watcher_name,
+                title=title,
+                body=body,
+                matched_order_no=matched_candidate,
+                order_suffix=rule.order_suffix,
+                uploader_name=uploader_name,
+                image_filename=unique_filename,
+                is_read=False,
             )
         )
+        reminder_count += 1
 
-    rows = db_session.scalars(query.limit(300)).all()
-    reminders = db_session.scalars(select(Reminder).where(Reminder.is_active.is_(True))).all()
+    db_session.commit()
 
-    destination_by_parcel: dict[int, str] = {}
-    for parcel in rows:
-        order_no = normalize_token(parcel.order_no)
-        group_candidates = [reminder.group.name for reminder in reminders if order_no.endswith(reminder.order_suffix)]
-        destination_by_parcel[parcel.id] = random.choice(group_candidates) if group_candidates else "未分组"
+    flash(
+        (
+            f"上传已记录到今日日志：拍照人 {uploader_name}。"
+            f"条码识别 {len(barcode_lines)} 条，OCR 识别 {len(ocr_lines)} 条，"
+            f"订单候选 {len(candidates)} 个，触发提醒 {reminder_count} 条。"
+        ),
+        "success",
+    )
+    return redirect(url_for("index"))
+
+
+@app.post("/notifications/<int:notification_id>/read")
+def mark_notification_read(notification_id: int):
+    db_session = g.db
+    notification = db_session.get(Notification, notification_id)
+    if notification is None:
+        flash("提醒不存在。", "danger")
+        return redirect(url_for("index"))
+
+    if not notification.is_read:
+        notification.is_read = True
+        db_session.commit()
+    return redirect(url_for("index"))
+
+
+@app.get("/uploads/<path:filename>")
+def uploaded_file(filename: str):
+    return send_from_directory(UPLOAD_DIR, filename)
+
+
+@app.get("/admin/")
+def admin_dashboard():
+    if not is_loopback_request():
+        abort(404)
+
+    DB_BACKUP_DIR.mkdir(exist_ok=True)
+    backups = sorted(DB_BACKUP_DIR.glob("*.db"), reverse=True)
+    session.setdefault("csrf_token", secrets.token_urlsafe(32))
 
     return render_template(
-        "parcels.html",
-        parcels=rows,
-        keyword=request.args.get("q", ""),
-        destination_by_parcel=destination_by_parcel,
+        "admin_dashboard.html",
+        db_path=str(DB_PATH),
+        db_exists=DB_PATH.exists(),
+        db_size=(DB_PATH.stat().st_size if DB_PATH.exists() else 0),
+        backups=backups,
+        max_db_backups=MAX_DB_BACKUPS,
+        csrf_token=session["csrf_token"],
     )
+
+
+@app.get("/admin/database/download")
+def admin_download_database():
+    if not is_loopback_request():
+        abort(404)
+    if not DB_PATH.exists():
+        abort(404)
+
+    return send_file(
+        DB_PATH,
+        as_attachment=True,
+        download_name=DB_PATH.name,
+        mimetype="application/vnd.sqlite3",
+    )
+
+
+@app.post("/admin/database/upload")
+def admin_upload_database():
+    if not is_loopback_request():
+        abort(404)
+
+    submitted_token = clean_text(request.form.get("csrf_token"))
+    session_token = clean_text(session.get("csrf_token"))
+    if not session_token or not hmac.compare_digest(submitted_token, session_token):
+        flash("安全校验失败，请重新提交。", "danger")
+        return redirect(url_for("admin_dashboard"))
+
+    uploaded = request.files.get("db_file")
+    if not uploaded or not uploaded.filename:
+        flash("请先选择要上传的 SQLite 数据库文件。", "danger")
+        return redirect(url_for("admin_dashboard"))
+
+    suffix = Path(uploaded.filename).suffix.lower()
+    if suffix not in {".db", ".sqlite", ".sqlite3"}:
+        flash("仅允许上传 .db/.sqlite/.sqlite3 文件。", "danger")
+        return redirect(url_for("admin_dashboard"))
+
+    temp_path = DB_PATH.with_name(DB_PATH.name + ".upload_tmp")
+    uploaded.save(temp_path)
+
+    if not is_valid_sqlite_file(temp_path):
+        temp_path.unlink(missing_ok=True)
+        flash("上传文件不是有效的 SQLite 数据库，已拒绝覆盖。", "danger")
+        return redirect(url_for("admin_dashboard"))
+
+    try:
+        engine.dispose()
+        backup_path = create_db_backup()
+        shutil.move(str(temp_path), str(DB_PATH))
+    except Exception as exc:
+        temp_path.unlink(missing_ok=True)
+        flash(f"覆盖数据库失败：{exc}", "danger")
+        return redirect(url_for("admin_dashboard"))
+
+    backup_note = f"，覆盖前已自动备份为 {backup_path.name}" if backup_path else "（覆盖前没有可备份的旧数据库）"
+    flash(f"数据库已成功覆盖{backup_note}。", "success")
+    return redirect(url_for("admin_dashboard"))
 
 
 def main() -> None:
     init_db()
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    print(f"公开入口（普通用户）： http://0.0.0.0:{PORT}/")
+    print(f"管理入口（仅 127.0.0.1 自动识别为超级管理员，无需登录）： http://127.0.0.1:{PORT}/admin/")
+    app.run(host="0.0.0.0", port=PORT, debug=False)
 
 
 if __name__ == "__main__":

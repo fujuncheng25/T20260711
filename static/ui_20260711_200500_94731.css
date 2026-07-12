@@ -359,6 +359,16 @@ button:hover,
   white-space: pre-line;
 }
 
+.preview-image {
+  display: block;
+  width: 100%;
+  max-height: 240px;
+  object-fit: cover;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  margin-top: 10px;
+}
+
 .note-item small {
   color: var(--muted);
 }

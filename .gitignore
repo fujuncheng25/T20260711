@@ -1,0 +1,16 @@
+# Runtime data (SQLite DB, admin backups, uploaded scan images)
+*.db
+*.sqlite
+*.sqlite3
+db_backups/
+uploads/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor/OS
+.vscode/
+.DS_Store

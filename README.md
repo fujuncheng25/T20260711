@@ -1,25 +1,23 @@
-# Logistics Group Notifier (Web + PostgreSQL)
+# Logistics Photo Log + Auto Reminder (Flask + SQLite)
 
-一个可直接运行的物流协同网站，核心能力：
+这个版本严格只保留两个功能：
 
-1. 将物流总表（CSV/XLS/XLSX）导入 PostgreSQL。
-2. 用户注册登录。
-3. 用户组管理（如 B组、C组），可添加组成员。
-4. 按订单尾号设置提醒，提醒文案可自定义（默认：您的快递到了）。
-5. 拍照上传快递面单后，系统 OCR + 一维码扫描识别订单号。
-6. 若识别出的订单号命中某组提醒尾号，自动给该组全部成员写入通知。
-7. 拍照者会看到该快递归属组；若多个组同时命中，随机显示一个。
+1. 拍照记录物流：上传面单照片时记录拍照上传人，并写入当日日志。
+2. 自动提醒：当识别到的快递单号命中已设置的尾号规则时，生成提醒；提醒中嵌入照片和拍照人。
 
-## UI 版本号与缓存
+不再包含登录、分组、注册等流程。
 
-本版本 UI 静态资源使用唯一编号：`20260711_200500_94731`
+## OCR 升级
 
-- `static/ui_20260711_200500_94731.css`
-- `static/ui_20260711_200500_94731.js`
+当前识别链路是多模型融合，而不是单一 OCR：
 
-页面通过 query 参数附加版本号，便于应对 Cloudflare 深缓存。
+- 条码识别：zxing-cpp
+- OCR 模型 1：RapidOCR (ONNX Runtime)
+- OCR 模型 2：EasyOCR (PyTorch)
 
-## 1) 环境准备
+系统会融合多路结果后再提取候选单号，并做尾号匹配。
+
+## 运行环境
 
 ```bash
 python -m venv .venv
@@ -27,55 +25,63 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## 2) PostgreSQL 初始化
-
-先在 PostgreSQL 中创建数据库，例如：
-
-```sql
-CREATE DATABASE logistics_alert;
-```
-
-配置环境变量（PowerShell）：
-
-```powershell
-$env:DATABASE_URL="postgresql+psycopg2://postgres:postgres@127.0.0.1:5432/logistics_alert"
-$env:SECRET_KEY="replace-with-a-strong-secret"
-```
-
-## 3) 启动网站
+## 启动
 
 ```bash
 python app.py
 ```
 
-打开：`http://127.0.0.1:5000`
+默认监听端口：`5000`。
 
-首次启动会自动建表。
+可选环境变量（PowerShell）：
 
-## 4) 页面使用流程
-
-1. 注册账号并登录。
-2. 在控制台导入物流总表。
-3. 创建用户组（例如 B组）。
-4. 给组添加成员（成员需先注册）。
-5. 在组里创建提醒：输入订单尾号 + 自定义通知文案。
-6. 在“拍照识别”页上传快递图片，系统识别后自动通知组成员。
-7. 在“通知中心”查看通知，在“物流总表”查看快递与目标组。
-
-## 5) 命令行导入（可选）
-
-你也可以用脚本把表格直接导入数据库：
-
-```bash
-python batch_fill.py --input your_logistics.xlsx
+```powershell
+$env:PORT="5000"
+$env:SECRET_KEY="replace-with-a-strong-secret"
+$env:SQLITE_DB_PATH="C:\path\to\logistics_alert.db"
 ```
 
-终端会输出新增/更新/跳过的记录数。
+## 页面功能
 
-## 6) 关键说明
+- 首页 `/`
+  - 上传照片 + 填写拍照人（写入今日日志）
+  - 创建/启用/停用尾号提醒规则
+  - 查看今日日志（含图片、拍照人、识别结果）
+  - 查看自动提醒记录（提醒内含图片和拍照人）
 
-- 条码识别使用 `zxing-cpp`（原生扩展模块，随 pip 安装，非系统可执行程序）。
-- OCR 使用 `easyocr`（PyTorch 模型，纯 pip 安装，进程内运行，不依赖任何系统可执行程序，可放心部署到任意 Linux 环境）。首次识别会自动下载一次模型权重文件（约几十至上百 MB，含中英文），之后离线复用本地缓存（默认缓存目录 `~/.EasyOCR`）。
-- 若机器有 NVIDIA GPU 且 PyTorch 检测到 CUDA，会自动使用 GPU 加速；否则自动回退到 CPU，无需额外配置。
-- 扫描命中规则：识别出的订单号 `endswith(提醒尾号)`。
-- 通知为站内通知（写入数据库）。
+- 上传文件访问 `/uploads/<filename>`
+
+- 管理入口（仅本机 loopback 可访问）
+  - `/admin/`
+  - `/admin/database/download`
+  - `/admin/database/upload`
+
+## 管理入口规则
+
+- 只有从本机 `127.0.0.1` / `::1` 发起请求时，`/admin/*` 才可访问。
+- 局域网、Tailscale、ZeroTier、公网来源访问 `/admin/*` 均返回 `404`。
+- 管理页支持下载/上传并覆盖 SQLite 文件，覆盖前自动备份并做完整性校验。
+
+## 批量导入脚本
+
+`batch_fill.py` 现在用于批量导入“提醒规则”，而不是物流总表。
+
+```bash
+python batch_fill.py --input reminders.xlsx
+```
+
+输入文件至少包含两列（大小写不敏感）：
+
+- `watcher_name`
+- `order_suffix`
+
+可选列：
+
+- `custom_message`
+- `is_active`
+
+## 说明
+
+- 数据库是 SQLite 单文件，无需 PostgreSQL。
+- OCR 仅依赖 Python 包，不依赖外部系统可执行程序。
+- EasyOCR 首次运行会下载模型权重，后续离线可复用缓存。

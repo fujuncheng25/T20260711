@@ -1,0 +1,151 @@
+{% extends "base.html" %}
+{% block title %}拍照日志与尾号提醒{% endblock %}
+{% block content %}
+{% set active_reminders = reminders | selectattr('is_active') | list %}
+{% set unread_notifications = notifications | rejectattr('is_read') | list %}
+
+<section class="panel hero rise-in">
+  <div>
+    <p class="hero-tag">Two Features Only</p>
+    <h2>拍照记录物流 + 自动尾号提醒</h2>
+    <p class="muted">每次上传会记录拍照人并写入今日日志，系统使用条码 + RapidOCR + EasyOCR 融合识别订单号，再按尾号匹配自动生成提醒。</p>
+  </div>
+  <div class="stats-grid">
+    <article class="stat-card">
+      <p>今日日志</p>
+      <h3>{{ today_logs | length }}</h3>
+    </article>
+    <article class="stat-card">
+      <p>启用提醒</p>
+      <h3>{{ active_reminders | length }}</h3>
+    </article>
+    <article class="stat-card">
+      <p>未读提醒</p>
+      <h3>{{ unread_notifications | length }}</h3>
+    </article>
+  </div>
+</section>
+
+<section class="layout-two">
+  <article class="panel rise-in">
+    <h3>1) 拍照记录物流</h3>
+    <p class="muted">上传面单照片并填写拍照人，系统会自动识别并将记录写入今日日志。</p>
+    <form method="post" action="{{ url_for('scan_and_record') }}" enctype="multipart/form-data" class="form-grid">
+      <label>
+        拍照上传人
+        <input type="text" name="uploader_name" placeholder="例如：小王" maxlength="80" required>
+      </label>
+      <label>
+        面单照片
+        <input type="file" name="pickup_image" accept="image/*" required>
+      </label>
+      <button type="submit" class="btn-primary">上传并写入今日日志</button>
+    </form>
+  </article>
+
+  <article class="panel rise-in">
+    <h3>2) 自动提醒设置</h3>
+    <p class="muted">当识别出的快递单号命中尾号时，自动生成提醒，提醒里会带上照片和拍照人。</p>
+    <form method="post" action="{{ url_for('create_reminder') }}" class="form-grid compact">
+      <label>
+        提醒接收人
+        <input type="text" name="watcher_name" maxlength="80" placeholder="例如：李姐" required>
+      </label>
+      <label>
+        快递尾号（至少 4 位）
+        <input type="text" name="order_suffix" maxlength="32" placeholder="例如：8926" required>
+      </label>
+      <label>
+        自定义提醒文案
+        <input type="text" name="custom_message" maxlength="240" value="{{ default_reminder_message }}" required>
+      </label>
+      <button type="submit" class="btn-secondary">创建提醒规则</button>
+    </form>
+
+    <div class="reminder-list">
+      {% for reminder in reminders %}
+        <article class="reminder-row {% if not reminder.is_active %}is-off{% endif %}">
+          <div>
+            <p><strong>{{ reminder.watcher_name }}</strong> · 尾号 <strong>{{ reminder.order_suffix }}</strong></p>
+            <small>{{ reminder.custom_message }}</small>
+          </div>
+          <form method="post" action="{{ url_for('toggle_reminder', reminder_id=reminder.id) }}">
+            {% if reminder.is_active %}
+              <button type="submit" class="btn-ghost small">停用</button>
+            {% else %}
+              <button type="submit" class="btn-ghost small">启用</button>
+            {% endif %}
+          </form>
+        </article>
+      {% else %}
+        <p class="muted">还没有提醒规则，请先创建。</p>
+      {% endfor %}
+    </div>
+  </article>
+</section>
+
+<section class="panel rise-in">
+  <div class="section-head">
+    <h3>今日日志（{{ today }}）</h3>
+    <small class="muted">每条都记录拍照人、识别到的单号和原图。</small>
+  </div>
+  {% if today_logs %}
+    <div class="group-grid">
+      {% for log in today_logs %}
+        <article class="group-card">
+          <p><strong>拍照人：</strong>{{ log.uploader_name }}</p>
+          <p class="muted">时间：{{ log.created_at.strftime('%H:%M:%S') }}</p>
+          <p><strong>识别单号：</strong>{{ log.recognized_order_no or '未识别到有效单号' }}</p>
+          <img
+            class="preview-image"
+            src="{{ url_for('uploaded_file', filename=log.image_filename) }}"
+            alt="上传图片 {{ log.image_filename }}"
+            loading="lazy"
+          >
+        </article>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="muted">今天还没有拍照记录。</p>
+  {% endif %}
+</section>
+
+<section class="panel rise-in">
+  <div class="section-head">
+    <h3>自动提醒记录</h3>
+    <small class="muted">提醒内容已嵌入拍照人和对应照片。</small>
+  </div>
+  {% if notifications %}
+    <ul class="note-list">
+      {% for item in notifications %}
+        <li class="note-item {% if not item.is_read %}unread{% endif %}">
+          <div class="section-head">
+            <strong>{{ item.title }}</strong>
+            <small>{{ item.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</small>
+          </div>
+          <p>{{ item.body }}</p>
+          <div class="chip-wrap">
+            <span class="chip">接收人：{{ item.watcher_name }}</span>
+            <span class="chip">拍照人：{{ item.uploader_name }}</span>
+            <span class="chip">尾号：{{ item.order_suffix }}</span>
+            <span class="chip">单号：{{ item.matched_order_no }}</span>
+          </div>
+          <img
+            class="preview-image"
+            src="{{ url_for('uploaded_file', filename=item.image_filename) }}"
+            alt="提醒关联图片 {{ item.image_filename }}"
+            loading="lazy"
+          >
+          {% if not item.is_read %}
+            <form method="post" action="{{ url_for('mark_notification_read', notification_id=item.id) }}" class="form-inline compact">
+              <button type="submit" class="btn-ghost small">标记已读</button>
+            </form>
+          {% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="muted">暂无提醒记录。</p>
+  {% endif %}
+</section>
+{% endblock %}

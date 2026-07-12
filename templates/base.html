@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}物流协同站{% endblock %}</title>
+  <title>{% block title %}物流拍照提醒站{% endblock %}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename=ui_css_file) }}?v={{ ui_build_id }}">
 </head>
 <body>
@@ -13,18 +13,12 @@
   <header class="site-header rise-in">
     <div class="brand-block">
       <p class="brand-kicker">Logistics Mesh</p>
-      <h1 class="brand-title">快递协同通知系统</h1>
+      <h1 class="brand-title">快递拍照日志与尾号提醒</h1>
     </div>
     <nav class="site-nav">
-      {% if current_user %}
-        <a href="{{ url_for('dashboard') }}">控制台</a>
-        <a href="{{ url_for('scan') }}">拍照识别</a>
-        <a href="{{ url_for('parcels') }}">物流总表</a>
-        <a href="{{ url_for('notifications') }}">通知中心</a>
-        <a href="{{ url_for('logout') }}">退出</a>
-      {% else %}
-        <a href="{{ url_for('login') }}">登录</a>
-        <a href="{{ url_for('register') }}">注册</a>
+      <a href="{{ url_for('index') }}">首页</a>
+      {% if is_super_admin %}
+        <a href="{{ url_for('admin_dashboard') }}">管理后台</a>
       {% endif %}
     </nav>
   </header>
