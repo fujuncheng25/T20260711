@@ -1,22 +1,19 @@
 {% extends "base.html" %}
-{% block title %}登录 - 物流协同站{% endblock %}
+{% block title %}登录{% endblock %}
 {% block content %}
-<section class="auth-wrap rise-in">
-  <article class="panel auth-panel">
-    <h2>登录账号</h2>
-    <p class="muted">先登录，再创建用户组、导入物流表和拍照识别快递。</p>
-    <form method="post" class="form-grid">
-      <label>
-        用户名
-        <input type="text" name="username" required autocomplete="username">
-      </label>
-      <label>
-        密码
-        <input type="password" name="password" required autocomplete="current-password">
-      </label>
-      <button type="submit" class="btn-primary">登录进入系统</button>
-    </form>
-    <p class="switch-link">还没有账号？<a href="{{ url_for('register') }}">去注册</a></p>
-  </article>
+<section class="card auth-card">
+  <h2>登录</h2>
+  <form method="post" class="form">
+    <label>
+      用户名
+      <input type="text" name="username" required autocomplete="username">
+    </label>
+    <label>
+      密码
+      <input type="password" name="password" required autocomplete="current-password">
+    </label>
+    <button type="submit">登录</button>
+  </form>
+  <p class="muted">还没有账号？<a href="{{ url_for('register') }}">去注册</a></p>
 </section>
 {% endblock %}

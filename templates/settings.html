@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}个人设置{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>分组设置</h2>
+  <p class="muted">在这里创建分组并添加成员，首页提醒可选择“分组提醒”通知整个组。</p>
+  <form method="post" action="{{ url_for('create_group') }}" class="form">
+    <label>
+      新分组名称
+      <input type="text" name="group_name" maxlength="80" required>
+    </label>
+    <button type="submit">创建分组</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>我的分组</h2>
+  {% if groups %}
+    <div class="group-wrap">
+      {% for group in groups %}
+        <article class="panel group-panel">
+          <h3>{{ group.name }}</h3>
+          <p class="muted">{% if group.is_owner %}你是组主{% else %}你是组成员{% endif %}</p>
+
+          <h4>成员</h4>
+          {% if group.members %}
+            <ul class="member-list">
+              {% for member in group.members %}
+                <li>{{ member.username }} <span class="muted">({{ member.role }})</span></li>
+              {% endfor %}
+            </ul>
+          {% else %}
+            <p class="muted">暂无成员。</p>
+          {% endif %}
+
+          {% if group.is_owner %}
+            <form method="post" action="{{ url_for('add_group_member', group_id=group.id) }}" class="form inline-form">
+              <label>
+                添加成员（用户名）
+                <input type="text" name="username" required>
+              </label>
+              <button type="submit" class="btn-lite">添加成员</button>
+            </form>
+          {% endif %}
+        </article>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="muted">你还没有加入任何分组。</p>
+  {% endif %}
+</section>
+{% endblock %}

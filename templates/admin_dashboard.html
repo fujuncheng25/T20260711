@@ -1,40 +1,36 @@
 {% extends "base.html" %}
-{% block title %}管理后台 - 物流协同站{% endblock %}
+{% block title %}管理后台{% endblock %}
 {% block content %}
-<section class="panel rise-in">
+<section class="card">
   <h2>SQLite 数据库管理</h2>
-  <p class="muted">当前数据库文件：{{ db_path }}</p>
+  <p class="muted">数据库文件：{{ db_path }}</p>
   {% if db_exists %}
     <p class="muted">文件大小：{{ (db_size / 1024) | round(1) }} KB</p>
   {% else %}
-    <p class="muted">数据库文件尚未创建（首次访问公开网站后会自动生成）。</p>
+    <p class="muted">数据库文件尚未创建。</p>
   {% endif %}
-  <a class="btn-primary" href="{{ url_for('admin_download_database') }}">下载当前数据库</a>
+  <p><a class="btn-link" href="{{ url_for('admin_download_database') }}">下载当前数据库</a></p>
 </section>
 
-<section class="panel rise-in">
-  <h3>上传并覆盖数据库</h3>
-  <p class="muted">上传的文件必须是有效、未损坏的 SQLite 数据库；覆盖前会自动创建备份（最多保留 {{ max_db_backups }} 份历史备份）。</p>
-  <form method="post" action="{{ url_for('admin_upload_database') }}" enctype="multipart/form-data" class="form-grid">
+<section class="card">
+  <h2>上传并覆盖数据库</h2>
+  <p class="muted">上传有效的 SQLite 文件后会覆盖当前数据库，覆盖前会自动备份。</p>
+  <form method="post" action="{{ url_for('admin_upload_database') }}" enctype="multipart/form-data" class="form" onsubmit="return confirm('确定覆盖当前数据库吗？');">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label>
-      选择 SQLite 数据库文件
+      选择数据库文件
       <input type="file" name="db_file" accept=".db,.sqlite,.sqlite3" required>
     </label>
-    <button
-      type="submit"
-      class="btn-primary"
-      onclick="return confirm('确定要覆盖当前数据库吗？此操作会替换所有现有数据（已自动创建备份）。');"
-    >上传并覆盖</button>
+    <button type="submit">上传并覆盖</button>
   </form>
 </section>
 
-<section class="panel rise-in">
-  <h3>历史备份（覆盖前自动生成）</h3>
+<section class="card">
+  <h2>历史备份（最多 {{ max_db_backups }} 份）</h2>
   {% if backups %}
-    <ul class="note-list">
+    <ul class="notes">
       {% for backup in backups %}
-        <li class="note-item">{{ backup.name }}</li>
+        <li class="panel">{{ backup.name }}</li>
       {% endfor %}
     </ul>
   {% else %}
