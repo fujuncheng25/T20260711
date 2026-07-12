@@ -1,4 +1,4 @@
-const CACHE_NAME = "tmall-local-static-v20260712-073000";
+const CACHE_NAME = "tmall-local-static-v20260712-081500";
 const RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 
 function shouldCacheRequest(request) {
@@ -75,6 +75,23 @@ self.addEventListener("fetch", (event) => {
 
   event.respondWith((async () => {
     const cache = await caches.open(CACHE_NAME);
+    if (request.mode === "navigate") {
+      try {
+        const network = await fetch(request);
+        if (network && network.ok) {
+          const stamped = await stampResponse(network.clone());
+          await cache.put(request, stamped);
+        }
+        return network;
+      } catch (error) {
+        const cachedNavigate = await cache.match(request);
+        if (cachedNavigate) {
+          return cachedNavigate;
+        }
+        throw error;
+      }
+    }
+
     const cached = await cache.match(request);
 
     if (cached && isFresh(cached)) {

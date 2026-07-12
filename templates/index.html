@@ -11,6 +11,7 @@
     data-poll-url="{{ url_for('poll_notifications') }}"
     data-initial-id="{{ latest_notification_id }}"
     data-bandwidth-saver="{{ 1 if bandwidth_saver_mode else 0 }}"
+    data-read-api-prefix="{{ url_for('api_mark_notification_read', notification_id=0) | replace('0/read', '') }}"
     hidden
   ></div>
   {% if recent_notifications %}
@@ -20,9 +21,12 @@
         {% if '的快递提醒' in display_title and item.body %}
           {% set display_title = item.body.split('\n')[0] %}
         {% endif %}
-        <li>
-          <strong class="js-local-time" data-utc="{{ to_utc_iso(item.created_at) }}" data-time-format="time">{{ item.created_at.strftime('%H:%M') }}</strong>
-          <span>{{ display_title }}</span>
+        <li class="msg-item" data-notification-id="{{ item.id }}">
+          <div class="msg-item-main">
+            <strong class="js-local-time" data-utc="{{ to_utc_iso(item.created_at) }}" data-time-format="time">{{ item.created_at.strftime('%H:%M') }}</strong>
+            <span>{{ display_title }}</span>
+          </div>
+          <button type="button" class="msg-delete-btn" aria-label="左滑删除消息">删除</button>
         </li>
       {% endfor %}
     </ul>
@@ -73,7 +77,7 @@
   {% if notifications %}
     <ul class="notes">
       {% for item in notifications %}
-        <li class="panel {% if not item.is_read %}unread{% endif %}">
+        <li class="panel {% if not item.is_read %}unread{% endif %}" data-notification-id="{{ item.id }}">
           <p>
             <strong>{{ item.title }}</strong>
             <span class="muted js-local-time" data-utc="{{ to_utc_iso(item.created_at) }}" data-time-format="datetime">{{ item.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</span>
@@ -81,7 +85,7 @@
           <p class="pre">{{ item.body }}</p>
           <img class="photo" src="{{ url_for('uploaded_file', filename=item.image_filename) }}" alt="提醒关联图片 {{ item.image_filename }}" loading="lazy">
           {% if not item.is_read %}
-            <form method="post" action="{{ url_for('mark_notification_read', notification_id=item.id) }}">
+            <form method="post" action="{{ url_for('mark_notification_read', notification_id=item.id) }}" class="js-mark-read-form" data-notification-id="{{ item.id }}">
               <button type="submit" class="btn-lite">标记已读</button>
             </form>
           {% endif %}

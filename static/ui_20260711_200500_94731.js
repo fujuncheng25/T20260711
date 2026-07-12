@@ -614,6 +614,223 @@
   const notifyButton = document.getElementById('enable-browser-notify');
   const messageBar = document.querySelector('.message-bar');
   let messageList = document.querySelector('.message-bar .msg-list');
+  const readApiPrefix = (pollAnchor && pollAnchor.dataset.readApiPrefix) ? pollAnchor.dataset.readApiPrefix : '/api/notifications/';
+
+  const toNotificationId = (value) => {
+    const parsed = Number(value || 0);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  };
+
+  const buildReadApiUrl = (notificationId) => `${readApiPrefix}${encodeURIComponent(String(notificationId))}/read`;
+
+  const ensureMessagePlaceholder = () => {
+    if (!messageBar || (messageList && messageList.children.length > 0)) {
+      return;
+    }
+
+    let emptyText = messageBar.querySelector('.message-bar-empty');
+    if (!emptyText) {
+      emptyText = document.createElement('p');
+      emptyText.className = 'muted message-bar-empty';
+      emptyText.textContent = '暂无到货提醒。';
+      messageBar.appendChild(emptyText);
+    }
+  };
+
+  const clearMessagePlaceholder = () => {
+    if (!messageBar) {
+      return;
+    }
+    const emptyText = messageBar.querySelector('.message-bar-empty, .muted');
+    if (emptyText && emptyText.closest('.message-bar') === messageBar && !emptyText.closest('.msg-item')) {
+      emptyText.remove();
+    }
+  };
+
+  const syncNotificationCardReadState = (notificationId) => {
+    const selector = `.notes li[data-notification-id="${notificationId}"]`;
+    const card = document.querySelector(selector);
+    if (!card) {
+      return;
+    }
+    card.classList.remove('unread');
+    const form = card.querySelector('.js-mark-read-form');
+    if (form) {
+      form.remove();
+    }
+  };
+
+  const removeMessageRowById = (notificationId) => {
+    if (!messageList || !notificationId) {
+      return;
+    }
+    const row = messageList.querySelector(`.msg-item[data-notification-id="${notificationId}"]`);
+    if (row) {
+      row.remove();
+    }
+    ensureMessagePlaceholder();
+  };
+
+  const markNotificationRead = async (notificationId) => {
+    const normalizedId = toNotificationId(notificationId);
+    if (!normalizedId) {
+      return false;
+    }
+
+    try {
+      const payload = await safeFetchJson(buildReadApiUrl(normalizedId), {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+      if (!payload.ok) {
+        return false;
+      }
+
+      syncNotificationCardReadState(normalizedId);
+      removeMessageRowById(normalizedId);
+      return true;
+    } catch (error) {
+      console.error(error);
+      return false;
+    }
+  };
+
+  const closeSwipedRows = (exceptRow = null) => {
+    if (!messageList) {
+      return;
+    }
+    messageList.querySelectorAll('.msg-item.is-swiped').forEach((row) => {
+      if (row !== exceptRow) {
+        row.classList.remove('is-swiped');
+      }
+    });
+  };
+
+  const bindMessageRowInteractions = (row) => {
+    if (!row || row.dataset.swipeBound === '1') {
+      return;
+    }
+    row.dataset.swipeBound = '1';
+
+    const deleteButton = row.querySelector('.msg-delete-btn');
+    const swipeThreshold = 36;
+    let startX = 0;
+    let lastX = 0;
+    let tracking = false;
+
+    row.addEventListener('touchstart', (event) => {
+      if (event.touches.length !== 1) {
+        return;
+      }
+      startX = event.touches[0].clientX;
+      lastX = startX;
+      tracking = true;
+    }, { passive: true });
+
+    row.addEventListener('touchmove', (event) => {
+      if (!tracking || event.touches.length !== 1) {
+        return;
+      }
+      lastX = event.touches[0].clientX;
+      if (lastX - startX < -8) {
+        event.preventDefault();
+      }
+    }, { passive: false });
+
+    row.addEventListener('touchend', () => {
+      if (!tracking) {
+        return;
+      }
+      tracking = false;
+      const delta = lastX - startX;
+      if (delta <= -swipeThreshold) {
+        closeSwipedRows(row);
+        row.classList.add('is-swiped');
+      } else if (delta >= swipeThreshold) {
+        row.classList.remove('is-swiped');
+      }
+    });
+
+    row.addEventListener('click', (event) => {
+      if (event.target.closest('.msg-delete-btn')) {
+        return;
+      }
+      if (row.classList.contains('is-swiped')) {
+        row.classList.remove('is-swiped');
+        event.preventDefault();
+        return;
+      }
+      closeSwipedRows(row);
+    });
+
+    if (deleteButton) {
+      deleteButton.addEventListener('click', async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const notificationId = toNotificationId(row.dataset.notificationId);
+        const removed = await markNotificationRead(notificationId);
+        if (!removed) {
+          row.classList.remove('is-swiped');
+        }
+      });
+    }
+  };
+
+  const createMessageRow = (item) => {
+    const notificationId = toNotificationId(item.id);
+    const localTime = formatLocalTime(item.created_at_utc || item.created_at, 'time', item.created_at || '--:--');
+
+    const row = document.createElement('li');
+    row.className = 'msg-item';
+    if (notificationId) {
+      row.dataset.notificationId = String(notificationId);
+    }
+
+    const main = document.createElement('div');
+    main.className = 'msg-item-main';
+
+    const strong = document.createElement('strong');
+    strong.textContent = localTime;
+    main.appendChild(strong);
+
+    const span = document.createElement('span');
+    span.textContent = String(item.title || '快递到了');
+    main.appendChild(span);
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'msg-delete-btn';
+    button.textContent = '删除';
+    button.setAttribute('aria-label', '左滑删除消息');
+
+    row.appendChild(main);
+    row.appendChild(button);
+    bindMessageRowInteractions(row);
+    return row;
+  };
+
+  const bindMarkReadForms = () => {
+    document.querySelectorAll('.js-mark-read-form').forEach((form) => {
+      if (form.dataset.bound === '1') {
+        return;
+      }
+      form.dataset.bound = '1';
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const notificationId = toNotificationId(form.dataset.notificationId);
+        const done = await markNotificationRead(notificationId);
+        if (!done) {
+          form.submit();
+        }
+      });
+    });
+  };
+
+  if (messageList) {
+    messageList.querySelectorAll('.msg-item').forEach((row) => bindMessageRowInteractions(row));
+  }
+  bindMarkReadForms();
+
   if (pollAnchor) {
     const pollUrl = pollAnchor.dataset.pollUrl || '';
     const isBandwidthSaver = pollAnchor.dataset.bandwidthSaver === '1';
@@ -662,10 +879,7 @@
 
     const prependMessage = (item) => {
       if (!messageList && messageBar) {
-        const emptyText = messageBar.querySelector('.muted');
-        if (emptyText) {
-          emptyText.remove();
-        }
+        clearMessagePlaceholder();
         messageList = document.createElement('ul');
         messageList.className = 'msg-list';
         messageBar.appendChild(messageList);
@@ -673,9 +887,16 @@
       if (!messageList) {
         return;
       }
-      const localTime = formatLocalTime(item.created_at_utc || item.created_at, 'time', item.created_at || '--:--');
-      const row = document.createElement('li');
-      row.innerHTML = `<strong>${escapeHtml(localTime)}</strong> <span>${escapeHtml(item.title || '快递到了')}</span>`;
+
+      const notificationId = toNotificationId(item.id);
+      if (notificationId) {
+        const exists = messageList.querySelector(`.msg-item[data-notification-id="${notificationId}"]`);
+        if (exists) {
+          return;
+        }
+      }
+
+      const row = createMessageRow(item);
       messageList.prepend(row);
       while (messageList.children.length > 8) {
         messageList.removeChild(messageList.lastElementChild);

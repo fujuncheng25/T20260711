@@ -51,7 +51,7 @@ SQLITE_HEADER = b"SQLite format 3\x00"
 PORT = int(os.getenv("PORT", "5000"))
 MAX_CONTENT_LENGTH_BYTES = 300 * 1024 * 1024
 
-UI_BUILD_ID = "20260712_073000_localtime"
+UI_BUILD_ID = "20260712_081500_swipefix"
 UI_CSS_FILE = "ui_20260711_200500_94731.css"
 UI_JS_FILE = "ui_20260711_200500_94731.js"
 SW_JS_FILE = "sw_20260712_050000_localcache.js"
@@ -1393,6 +1393,25 @@ def mark_notification_read(notification_id: int):
         notification.is_read = True
         g.db.commit()
     return redirect(url_for("index"))
+
+
+@app.post("/api/notifications/<int:notification_id>/read")
+@login_required
+def api_mark_notification_read(notification_id: int):
+    notification = g.db.scalar(
+        select(Notification).where(
+            Notification.id == notification_id,
+            Notification.watcher_name == g.current_user.username,
+        )
+    )
+    if notification is None:
+        return jsonify({"ok": False, "error": "提醒不存在。"}), 404
+
+    if not notification.is_read:
+        notification.is_read = True
+        g.db.commit()
+
+    return jsonify({"ok": True, "id": int(notification.id), "is_read": True})
 
 
 @app.get("/api/notifications/poll")
