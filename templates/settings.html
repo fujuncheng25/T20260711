@@ -2,9 +2,34 @@
 {% block title %}个人设置{% endblock %}
 {% block content %}
 <section class="card">
-  <h2>分组设置</h2>
-  <p class="muted">在这里创建分组并添加成员，首页提醒可选择“分组提醒”通知整个组。</p>
-  <form method="post" action="{{ url_for('create_group') }}" class="form">
+  <h2>我的分组通知设置</h2>
+  {% if my_group_settings %}
+    <ul class="list">
+      {% for item in my_group_settings %}
+        <li>
+          <div>
+            <p><strong>{{ item.group_name }}</strong></p>
+            <p class="muted">当前状态：{% if item.receive_notifications %}接收本组通知{% else %}不接收本组通知{% endif %}</p>
+          </div>
+          <form method="post" action="{{ url_for('toggle_group_notification', group_id=item.group_id) }}">
+            {% if item.receive_notifications %}
+              <button type="submit" class="btn-lite">关闭接收</button>
+            {% else %}
+              <button type="submit" class="btn-lite">开启接收</button>
+            {% endif %}
+          </form>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="muted">你当前不在任何分组中。</p>
+  {% endif %}
+</section>
+
+{% if is_super_admin %}
+<section class="card">
+  <h2>超级管理员：分组管理</h2>
+  <form method="post" action="{{ url_for('create_group') }}" class="form inline-form">
     <label>
       新分组名称
       <input type="text" name="group_name" maxlength="80" required>
@@ -14,39 +39,39 @@
 </section>
 
 <section class="card">
-  <h2>我的分组</h2>
-  {% if groups %}
+  <h2>超级管理员：成员管理</h2>
+  {% if admin_groups %}
     <div class="group-wrap">
-      {% for group in groups %}
+      {% for group in admin_groups %}
         <article class="panel group-panel">
           <h3>{{ group.name }}</h3>
-          <p class="muted">{% if group.is_owner %}你是组主{% else %}你是组成员{% endif %}</p>
-
-          <h4>成员</h4>
           {% if group.members %}
             <ul class="member-list">
               {% for member in group.members %}
-                <li>{{ member.username }} <span class="muted">({{ member.role }})</span></li>
+                <li>
+                  {{ member.username }}
+                  <span class="muted">({{ member.role }})</span>
+                  <span class="muted">{% if member.receive_notifications %}接收通知{% else %}不接收通知{% endif %}</span>
+                </li>
               {% endfor %}
             </ul>
           {% else %}
-            <p class="muted">暂无成员。</p>
+            <p class="muted">该组暂时没有成员。</p>
           {% endif %}
 
-          {% if group.is_owner %}
-            <form method="post" action="{{ url_for('add_group_member', group_id=group.id) }}" class="form inline-form">
-              <label>
-                添加成员（用户名）
-                <input type="text" name="username" required>
-              </label>
-              <button type="submit" class="btn-lite">添加成员</button>
-            </form>
-          {% endif %}
+          <form method="post" action="{{ url_for('add_group_member', group_id=group.id) }}" class="form inline-form">
+            <label>
+              添加成员（用户名）
+              <input type="text" name="username" required>
+            </label>
+            <button type="submit" class="btn-lite">添加</button>
+          </form>
         </article>
       {% endfor %}
     </div>
   {% else %}
-    <p class="muted">你还没有加入任何分组。</p>
+    <p class="muted">还没有分组。</p>
   {% endif %}
 </section>
+{% endif %}
 {% endblock %}

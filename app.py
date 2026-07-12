@@ -11,7 +11,7 @@ import threading
 import uuid
 from functools import wraps
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, cast
 
 import numpy as np
 from flask import (
@@ -19,6 +19,7 @@ from flask import (
     abort,
     flash,
     g,
+    jsonify,
     redirect,
     render_template,
     request,
@@ -104,6 +105,7 @@ class GroupMember(Base):
     group_id: Mapped[int] = mapped_column(ForeignKey("user_groups.id"), nullable=False, index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
     role: Mapped[str] = mapped_column(String(20), nullable=False, default="member")
+    receive_notifications: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False, default=dt.datetime.utcnow)
 
 
@@ -113,6 +115,7 @@ class ReminderRule(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     watcher_name: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
     order_suffix: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    item_name: Mapped[str] = mapped_column(String(120), nullable=False, default="")
     custom_message: Mapped[str] = mapped_column(String(240), nullable=False, default=DEFAULT_REMINDER_MESSAGE)
     target_group_id: Mapped[int | None] = mapped_column(ForeignKey("user_groups.id"), nullable=True, index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
@@ -271,6 +274,8 @@ def init_db() -> None:
     rebuild_legacy_tables_if_needed()
     Base.metadata.create_all(engine)
     ensure_column_exists("reminder_rules", "target_group_id", "INTEGER")
+    ensure_column_exists("reminder_rules", "item_name", "VARCHAR(120) NOT NULL DEFAULT ''")
+    ensure_column_exists("group_members", "receive_notifications", "BOOLEAN NOT NULL DEFAULT 1")
 
 
 def normalize_token(value: object) -> str:
@@ -325,6 +330,64 @@ def suffix_matches(candidate: str, suffix: str) -> bool:
     if len(suffix_digits) < 4:
         return False
     return digits_only(candidate).endswith(suffix_digits)
+
+
+def lcs_length(left: str, right: str) -> int:
+    left = normalize_token(left)
+    right = normalize_token(right)
+    if not left or not right:
+        return 0
+
+    if len(left) > len(right):
+        left, right = right, left
+
+    previous_row = [0] * (len(left) + 1)
+    for right_char in right:
+        current_row = [0]
+        for index, left_char in enumerate(left, start=1):
+            if left_char == right_char:
+                current_row.append(previous_row[index - 1] + 1)
+            else:
+                current_row.append(max(previous_row[index], current_row[index - 1]))
+        previous_row = current_row
+    return previous_row[-1]
+
+
+def rank_pickup_logs_by_lcs(logs: Iterable[PickupLog], query: str, limit: int = 20) -> list[dict[str, object]]:
+    normalized_query = normalize_token(query)
+    if not normalized_query:
+        return []
+
+    scored: list[dict[str, object]] = []
+    for log in logs:
+        order_no = clean_text(getattr(log, "recognized_order_no", ""))
+        normalized_order_no = normalize_token(order_no)
+        if not normalized_order_no:
+            continue
+
+        lcs = lcs_length(normalized_query, normalized_order_no)
+        if lcs <= 0:
+            continue
+
+        score = lcs / max(len(normalized_query), len(normalized_order_no))
+        scored.append(
+            {
+                "log": log,
+                "order_no": order_no,
+                "lcs": int(lcs),
+                "score": float(score),
+            }
+        )
+
+    scored.sort(
+        key=lambda item: (
+            int(item["lcs"]),
+            float(item["score"]),
+            cast(PickupLog, item["log"]).created_at,
+        ),
+        reverse=True,
+    )
+    return scored[:limit]
 
 
 def is_loopback_request() -> bool:
@@ -488,6 +551,19 @@ def login_required(view_func):
     return wrapped
 
 
+def super_admin_required(view_func):
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        if getattr(g, "current_user", None) is None:
+            flash("请先登录。", "warning")
+            return redirect(url_for("login", next=clean_text(request.path)))
+        if not is_loopback_request():
+            abort(403)
+        return view_func(*args, **kwargs)
+
+    return wrapped
+
+
 def get_group_membership(db_session, user_id: int, group_id: int) -> GroupMember | None:
     return db_session.scalar(
         select(GroupMember).where(GroupMember.user_id == user_id, GroupMember.group_id == group_id)
@@ -639,39 +715,16 @@ def index():
         .limit(300)
     ).all()
 
-    today = dt.date.today()
-    start = dt.datetime.combine(today, dt.time.min)
-    end = start + dt.timedelta(days=1)
-    today_logs = db_session.scalars(
-        select(PickupLog)
-        .where(PickupLog.created_at >= start, PickupLog.created_at < end)
-        .order_by(desc(PickupLog.created_at))
-        .limit(300)
-    ).all()
-
-    user_groups = list_groups_for_user(db_session, g.current_user.id)
-    group_name_by_id = {item["id"]: item["name"] for item in user_groups}
-
-    missing_group_ids = {
-        int(rule.target_group_id)
-        for rule in reminders
-        if rule.target_group_id is not None and int(rule.target_group_id) not in group_name_by_id
-    }
-    if missing_group_ids:
-        rows = db_session.execute(
-            select(UserGroup.id, UserGroup.name).where(UserGroup.id.in_(sorted(missing_group_ids)))
-        ).all()
-        for row in rows:
-            group_name_by_id[int(row[0])] = str(row[1])
+    unread = [item for item in notifications if not item.is_read]
+    recent_notifications = unread[:8] if unread else notifications[:8]
+    latest_notification_id = int(notifications[0].id) if notifications else 0
 
     return render_template(
         "index.html",
         reminders=reminders,
         notifications=notifications,
-        today_logs=today_logs,
-        today=today,
-        user_groups=user_groups,
-        group_name_by_id=group_name_by_id,
+        recent_notifications=recent_notifications,
+        latest_notification_id=latest_notification_id,
         default_reminder_message=DEFAULT_REMINDER_MESSAGE,
     )
 
@@ -679,41 +732,28 @@ def index():
 @app.post("/reminders/create")
 @login_required
 def create_reminder():
-    order_suffix = normalize_token(request.form.get("order_suffix"))
-    custom_message = clean_text(request.form.get("custom_message")) or DEFAULT_REMINDER_MESSAGE
-    target_group_raw = clean_text(request.form.get("target_group_id"))
+    order_suffix = digits_only(clean_text(request.form.get("order_suffix")))
+    item_name = clean_text(request.form.get("item_name"))
 
     if len(order_suffix) < 4:
-        flash("快递尾号至少输入 4 位。", "danger")
+        flash("快递尾号至少输入 4 位数字。", "danger")
         return redirect(url_for("index"))
-
-    target_group_id: int | None = None
-    if target_group_raw:
-        try:
-            target_group_id = int(target_group_raw)
-        except ValueError:
-            flash("分组参数错误。", "danger")
-            return redirect(url_for("index"))
-
-        membership = get_group_membership(g.db, g.current_user.id, target_group_id)
-        if membership is None:
-            flash("你不在这个分组里，不能把提醒发给该组。", "danger")
-            return redirect(url_for("index"))
 
     reminder = ReminderRule(
         watcher_name=g.current_user.username,
         order_suffix=order_suffix,
-        custom_message=custom_message,
-        target_group_id=target_group_id,
+        item_name=item_name,
+        custom_message=(item_name or DEFAULT_REMINDER_MESSAGE),
+        target_group_id=None,
         is_active=True,
     )
     g.db.add(reminder)
     g.db.commit()
 
-    if target_group_id is None:
-        flash(f"提醒已创建（个人）：{g.current_user.username} / 尾号 {order_suffix}", "success")
+    if item_name:
+        flash(f"提醒已设置：尾号 {order_suffix} / 物品 {item_name}", "success")
     else:
-        flash(f"提醒已创建（分组）：尾号 {order_suffix}", "success")
+        flash(f"提醒已设置：尾号 {order_suffix}", "success")
     return redirect(url_for("index"))
 
 
@@ -780,31 +820,43 @@ def scan_and_record():
         .order_by(ReminderRule.created_at.asc())
     ).all()
 
-    group_ids = sorted(
-        {
-            int(rule.target_group_id)
-            for rule in reminder_rules
-            if rule.target_group_id is not None
-        }
-    )
-
-    group_name_map: dict[int, str] = {}
-    group_member_map: dict[int, list[str]] = {}
-    if group_ids:
-        name_rows = g.db.execute(
-            select(UserGroup.id, UserGroup.name).where(UserGroup.id.in_(group_ids))
+    watcher_names = sorted({rule.watcher_name for rule in reminder_rules if clean_text(rule.watcher_name)})
+    watcher_rows = []
+    if watcher_names:
+        watcher_rows = g.db.execute(
+            select(User.id, User.username).where(User.username.in_(watcher_names))
         ).all()
-        group_name_map = {int(row[0]): str(row[1]) for row in name_rows}
 
-        member_rows = g.db.execute(
-            select(GroupMember.group_id, User.username)
+    watcher_id_by_name = {str(row[1]): int(row[0]) for row in watcher_rows}
+    watcher_ids = [int(row[0]) for row in watcher_rows]
+
+    creator_groups_map: dict[int, set[int]] = {}
+    if watcher_ids:
+        creator_group_rows = g.db.execute(
+            select(GroupMember.user_id, GroupMember.group_id).where(GroupMember.user_id.in_(watcher_ids))
+        ).all()
+        for row in creator_group_rows:
+            creator_groups_map.setdefault(int(row[0]), set()).add(int(row[1]))
+
+    all_group_ids = sorted({group_id for groups in creator_groups_map.values() for group_id in groups})
+    group_name_map: dict[int, str] = {}
+    group_recipient_map: dict[int, list[str]] = {}
+    if all_group_ids:
+        group_name_rows = g.db.execute(
+            select(UserGroup.id, UserGroup.name).where(UserGroup.id.in_(all_group_ids))
+        ).all()
+        group_name_map = {int(row[0]): str(row[1]) for row in group_name_rows}
+
+        recipient_rows = g.db.execute(
+            select(GroupMember.group_id, User.username, GroupMember.receive_notifications)
             .join(User, User.id == GroupMember.user_id)
-            .where(GroupMember.group_id.in_(group_ids))
+            .where(GroupMember.group_id.in_(all_group_ids))
             .order_by(GroupMember.group_id.asc(), User.username.asc())
         ).all()
-        for row in member_rows:
-            group_id = int(row[0])
-            group_member_map.setdefault(group_id, []).append(str(row[1]))
+        for row in recipient_rows:
+            if not bool(row[2]):
+                continue
+            group_recipient_map.setdefault(int(row[0]), []).append(str(row[1]))
 
     matched_rules = 0
     notification_count = 0
@@ -815,26 +867,34 @@ def scan_and_record():
             continue
 
         matched_rules += 1
-        recipients: list[str]
-        scope_text: str
+        recipients = {rule.watcher_name}
+        scope_text = "个人提醒"
+        creator_group_names: list[str] = []
 
-        if rule.target_group_id is None:
-            recipients = [rule.watcher_name]
-            scope_text = "个人提醒"
-        else:
-            target_group_id = int(rule.target_group_id)
-            recipients = sorted(set(group_member_map.get(target_group_id, [])))
-            group_name = group_name_map.get(target_group_id, f"组#{target_group_id}")
-            scope_text = f"分组提醒: {group_name}"
+        creator_id = watcher_id_by_name.get(rule.watcher_name)
+        if creator_id is not None:
+            for group_id in sorted(creator_groups_map.get(creator_id, set())):
+                members = group_recipient_map.get(group_id, [])
+                if not members:
+                    continue
+                recipients.update(members)
+                creator_group_names.append(group_name_map.get(group_id, f"组#{group_id}"))
+
+        if creator_group_names:
+            scope_text = f"个人 + 分组: {'、'.join(creator_group_names)}"
 
         if not recipients:
             continue
 
+        item_name = clean_text(getattr(rule, "item_name", ""))
         custom_message = clean_text(rule.custom_message) or DEFAULT_REMINDER_MESSAGE
-        for recipient in recipients:
-            title = f"{recipient} 的快递提醒"
+        headline = f"{item_name} 到了" if item_name else (custom_message or "快递到了")
+
+        for recipient in sorted(recipients):
+            title = headline
             body = (
-                f"{custom_message}\n"
+                f"{headline}\n"
+                f"提醒创建人: {rule.watcher_name}\n"
                 f"拍照人: {uploader_name}\n"
                 f"命中尾号: {rule.order_suffix}\n"
                 f"识别单号: {matched_candidate}\n"
@@ -872,48 +932,70 @@ def scan_and_record():
 @app.get("/settings")
 @login_required
 def settings_page():
-    user_id = g.current_user.id
+    user_id = int(g.current_user.id)
 
-    my_group_ids = [
-        int(row[0])
-        for row in g.db.execute(
-            select(GroupMember.group_id).where(GroupMember.user_id == user_id)
-        ).all()
+    my_memberships = g.db.execute(
+        select(GroupMember.group_id, GroupMember.receive_notifications, UserGroup.name)
+        .join(UserGroup, UserGroup.id == GroupMember.group_id)
+        .where(GroupMember.user_id == user_id)
+        .order_by(UserGroup.name.asc())
+    ).all()
+
+    my_group_settings = [
+        {
+            "group_id": int(row[0]),
+            "receive_notifications": bool(row[1]),
+            "group_name": str(row[2]),
+        }
+        for row in my_memberships
     ]
 
-    groups: list[dict[str, object]] = []
-    if my_group_ids:
-        group_rows = g.db.scalars(
-            select(UserGroup).where(UserGroup.id.in_(my_group_ids)).order_by(UserGroup.name.asc())
-        ).all()
-        member_rows = g.db.execute(
-            select(GroupMember.group_id, User.username, GroupMember.role)
-            .join(User, User.id == GroupMember.user_id)
-            .where(GroupMember.group_id.in_(my_group_ids))
-            .order_by(GroupMember.group_id.asc(), User.username.asc())
-        ).all()
+    admin_groups: list[dict[str, object]] = []
+    if is_loopback_request():
+        group_rows = g.db.scalars(select(UserGroup).order_by(UserGroup.name.asc())).all()
+        group_ids = [int(group.id) for group in group_rows]
 
-        member_map: dict[int, list[dict[str, str]]] = {}
-        for row in member_rows:
-            member_map.setdefault(int(row[0]), []).append(
-                {"username": str(row[1]), "role": str(row[2])}
-            )
+        member_map: dict[int, list[dict[str, object]]] = {}
+        if group_ids:
+            member_rows = g.db.execute(
+                select(
+                    GroupMember.group_id,
+                    User.username,
+                    GroupMember.role,
+                    GroupMember.receive_notifications,
+                )
+                .join(User, User.id == GroupMember.user_id)
+                .where(GroupMember.group_id.in_(group_ids))
+                .order_by(GroupMember.group_id.asc(), User.username.asc())
+            ).all()
+            for row in member_rows:
+                member_map.setdefault(int(row[0]), []).append(
+                    {
+                        "username": str(row[1]),
+                        "role": str(row[2]),
+                        "receive_notifications": bool(row[3]),
+                    }
+                )
 
-        groups = [
+        admin_groups = [
             {
-                "id": group.id,
-                "name": group.name,
-                "is_owner": int(group.created_by) == int(user_id),
+                "id": int(group.id),
+                "name": str(group.name),
                 "members": member_map.get(int(group.id), []),
             }
             for group in group_rows
         ]
 
-    return render_template("settings.html", groups=groups)
+    return render_template(
+        "settings.html",
+        my_group_settings=my_group_settings,
+        admin_groups=admin_groups,
+        is_super_admin=is_loopback_request(),
+    )
 
 
 @app.post("/settings/groups/create")
-@login_required
+@super_admin_required
 def create_group():
     group_name = clean_text(request.form.get("group_name"))
     if len(group_name) < 1:
@@ -921,16 +1003,23 @@ def create_group():
         return redirect(url_for("settings_page"))
 
     existing = g.db.scalar(
-        select(UserGroup).where(UserGroup.name == group_name, UserGroup.created_by == g.current_user.id)
+        select(UserGroup).where(UserGroup.name == group_name)
     )
     if existing is not None:
-        flash("你已创建过同名分组。", "warning")
+        flash("该分组已存在。", "warning")
         return redirect(url_for("settings_page"))
 
     group = UserGroup(name=group_name, created_by=g.current_user.id)
     g.db.add(group)
     g.db.flush()
-    g.db.add(GroupMember(group_id=group.id, user_id=g.current_user.id, role="owner"))
+    g.db.add(
+        GroupMember(
+            group_id=group.id,
+            user_id=g.current_user.id,
+            role="owner",
+            receive_notifications=True,
+        )
+    )
     g.db.commit()
 
     flash(f"分组已创建：{group_name}", "success")
@@ -938,15 +1027,11 @@ def create_group():
 
 
 @app.post("/settings/groups/<int:group_id>/members/add")
-@login_required
+@super_admin_required
 def add_group_member(group_id: int):
     group = g.db.get(UserGroup, group_id)
     if group is None:
         flash("分组不存在。", "danger")
-        return redirect(url_for("settings_page"))
-
-    if int(group.created_by) != int(g.current_user.id):
-        flash("只有组主可以添加成员。", "danger")
         return redirect(url_for("settings_page"))
 
     username = clean_text(request.form.get("username"))
@@ -963,12 +1048,41 @@ def add_group_member(group_id: int):
         select(GroupMember).where(GroupMember.group_id == group_id, GroupMember.user_id == user_to_add.id)
     )
     if existing_member is not None:
-        flash("该用户已在组内。", "info")
+        existing_member.receive_notifications = True
+        g.db.commit()
+        flash("该用户已在组内，已恢复为默认接收本组通知。", "info")
         return redirect(url_for("settings_page"))
 
-    g.db.add(GroupMember(group_id=group_id, user_id=user_to_add.id, role="member"))
+    g.db.add(
+        GroupMember(
+            group_id=group_id,
+            user_id=user_to_add.id,
+            role="member",
+            receive_notifications=True,
+        )
+    )
     g.db.commit()
     flash(f"已添加成员：{username}", "success")
+    return redirect(url_for("settings_page"))
+
+
+@app.post("/settings/groups/<int:group_id>/notifications/toggle")
+@login_required
+def toggle_group_notification(group_id: int):
+    membership = g.db.scalar(
+        select(GroupMember).where(
+            GroupMember.group_id == group_id,
+            GroupMember.user_id == g.current_user.id,
+        )
+    )
+    if membership is None:
+        flash("你不在该分组中。", "danger")
+        return redirect(url_for("settings_page"))
+
+    membership.receive_notifications = not membership.receive_notifications
+    g.db.commit()
+    state_text = "开启" if membership.receive_notifications else "关闭"
+    flash(f"已{state_text}本组通知接收。", "success")
     return redirect(url_for("settings_page"))
 
 
@@ -989,6 +1103,96 @@ def mark_notification_read(notification_id: int):
         notification.is_read = True
         g.db.commit()
     return redirect(url_for("index"))
+
+
+@app.get("/api/notifications/poll")
+@login_required
+def poll_notifications():
+    after_id_raw = clean_text(request.args.get("after_id"))
+    try:
+        after_id = max(int(after_id_raw or "0"), 0)
+    except ValueError:
+        after_id = 0
+
+    rows = g.db.scalars(
+        select(Notification)
+        .where(
+            Notification.watcher_name == g.current_user.username,
+            Notification.id > after_id,
+        )
+        .order_by(Notification.id.asc())
+        .limit(20)
+    ).all()
+
+    max_id = after_id
+    items: list[dict[str, object]] = []
+    for row in rows:
+        max_id = max(max_id, int(row.id))
+        first_line = clean_text(row.body).splitlines()
+        preview = first_line[0] if first_line else ""
+        items.append(
+            {
+                "id": int(row.id),
+                "title": clean_text(row.title),
+                "body": preview,
+                "order_suffix": clean_text(row.order_suffix),
+                "created_at": row.created_at.strftime("%H:%M:%S"),
+            }
+        )
+
+    return jsonify({"items": items, "max_id": max_id})
+
+
+@app.get("/logs")
+@login_required
+def logs_page():
+    search_query = clean_text(request.args.get("q"))
+    logs = g.db.scalars(
+        select(PickupLog)
+        .order_by(desc(PickupLog.created_at))
+        .limit(400)
+    ).all()
+
+    search_results = rank_pickup_logs_by_lcs(logs, search_query, limit=20) if search_query else []
+
+    return render_template(
+        "logs.html",
+        logs=logs,
+        search_query=search_query,
+        search_results=search_results,
+    )
+
+
+@app.get("/api/orders/search")
+@login_required
+def api_search_orders():
+    query = clean_text(request.args.get("q"))
+    normalized_query = normalize_token(query)
+    if len(normalized_query) < 2:
+        return jsonify({"query": query, "normalized_query": normalized_query, "items": []})
+
+    logs = g.db.scalars(
+        select(PickupLog)
+        .where(PickupLog.recognized_order_no != "")
+        .order_by(desc(PickupLog.created_at))
+        .limit(600)
+    ).all()
+    ranked = rank_pickup_logs_by_lcs(logs, normalized_query, limit=20)
+
+    items = [
+        {
+            "log_id": int(cast(PickupLog, item["log"]).id),
+            "order_no": str(item["order_no"]),
+            "lcs": int(item["lcs"]),
+            "score": round(float(item["score"]), 4),
+            "uploader_name": cast(PickupLog, item["log"]).uploader_name,
+            "created_at": cast(PickupLog, item["log"]).created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "image_url": url_for("uploaded_file", filename=cast(PickupLog, item["log"]).image_filename),
+        }
+        for item in ranked
+    ]
+
+    return jsonify({"query": query, "normalized_query": normalized_query, "items": items})
 
 
 @app.get("/uploads/<path:filename>")

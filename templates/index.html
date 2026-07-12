@@ -1,77 +1,52 @@
 {% extends "base.html" %}
 {% block title %}首页 - 物流拍照提醒站{% endblock %}
 {% block content %}
-<section class="core-grid">
-  <article class="card core-card">
-    <h2>拍照记录物流</h2>
-    <p class="muted">上传人固定为当前登录用户：<strong>{{ current_user.username }}</strong></p>
-    <form method="post" action="{{ url_for('scan_and_record') }}" enctype="multipart/form-data" class="form">
-      <label>
-        面单照片
-        <input type="file" name="pickup_image" accept="image/*" required>
-      </label>
-      <button type="submit" class="big-button">拍照上传并识别</button>
-    </form>
-  </article>
-
-  <article class="card core-card">
-    <h2>设置快递提醒</h2>
-    <p class="muted">收件人默认为当前登录用户，也可选择分组通知。</p>
-    <form method="post" action="{{ url_for('create_reminder') }}" class="form">
-      <label>
-        快递尾号（至少 4 位）
-        <input type="text" name="order_suffix" maxlength="32" required>
-      </label>
-      <label>
-        自定义提醒文案
-        <input type="text" name="custom_message" maxlength="240" value="{{ default_reminder_message }}" required>
-      </label>
-      <label>
-        通知范围（可选分组）
-        <select name="target_group_id">
-          <option value="">个人提醒（只通知 {{ current_user.username }}）</option>
-          {% for group in user_groups %}
-            <option value="{{ group.id }}">分组提醒：{{ group.name }}</option>
-          {% endfor %}
-        </select>
-      </label>
-      <button type="submit">创建提醒规则</button>
-    </form>
-
-    <h3>我的提醒规则</h3>
-    {% if reminders %}
-      <ul class="list">
-        {% for reminder in reminders %}
-          <li>
-            <div>
-              <p><strong>尾号 {{ reminder.order_suffix }}</strong></p>
-              <p class="muted">{{ reminder.custom_message }}</p>
-              {% if reminder.target_group_id %}
-                <p class="muted">范围：分组 {{ group_name_by_id.get(reminder.target_group_id, '已删除分组') }}</p>
-              {% else %}
-                <p class="muted">范围：个人（{{ reminder.watcher_name }}）</p>
-              {% endif %}
-            </div>
-            <form method="post" action="{{ url_for('toggle_reminder', reminder_id=reminder.id) }}">
-              {% if reminder.is_active %}
-                <button type="submit" class="btn-lite">停用</button>
-              {% else %}
-                <button type="submit" class="btn-lite">启用</button>
-              {% endif %}
-            </form>
-          </li>
-        {% endfor %}
-      </ul>
-    {% else %}
-      <p class="muted">还没有提醒规则。</p>
-    {% endif %}
-  </article>
+<section class="card message-bar">
+  <div class="message-bar-head">
+    <h2>消息栏</h2>
+    <button id="enable-browser-notify" type="button" class="btn-lite">开启系统通知</button>
+  </div>
+  <div id="notification-poll-anchor" data-poll-url="{{ url_for('poll_notifications') }}" data-initial-id="{{ latest_notification_id }}" hidden></div>
+  {% if recent_notifications %}
+    <ul class="msg-list">
+      {% for item in recent_notifications %}
+        {% set display_title = item.title %}
+        {% if '的快递提醒' in display_title and item.body %}
+          {% set display_title = item.body.split('\n')[0] %}
+        {% endif %}
+        <li>
+          <strong>{{ item.created_at.strftime('%H:%M') }}</strong>
+          <span>{{ display_title }}</span>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="muted">暂无到货提醒。</p>
+  {% endif %}
 </section>
 
-<section class="card">
-  <h2>其他功能（放在下方，不影响上面两块核心功能）</h2>
-  <p class="muted">你可以在个人设置中管理分组和组成员。</p>
-  <p><a class="btn-link" href="{{ url_for('settings_page') }}">进入个人设置</a></p>
+<section class="core-grid">
+  <article class="card core-card camera-card">
+    <form id="camera-form" method="post" action="{{ url_for('scan_and_record') }}" enctype="multipart/form-data" class="camera-form">
+      <input id="pickup-image-input" type="file" name="pickup_image" accept="image/*" hidden required>
+      <button id="camera-button" type="button" class="camera-circle" aria-label="拍照上传">📷</button>
+    </form>
+  </article>
+
+  <article class="card core-card reminder-card">
+    <h2>设置快递提醒</h2>
+    <form method="post" action="{{ url_for('create_reminder') }}" class="form compact-form">
+      <label>
+        尾号（4位数字）
+        <input type="text" name="order_suffix" inputmode="numeric" pattern="[0-9]{4,}" maxlength="12" required>
+      </label>
+      <label>
+        物品名称（可选）
+        <input type="text" name="item_name" maxlength="120" placeholder="例如：耳机">
+      </label>
+      <button type="submit">确定</button>
+    </form>
+  </article>
 </section>
 
 <section class="card">
@@ -82,7 +57,6 @@
         <li class="panel {% if not item.is_read %}unread{% endif %}">
           <p><strong>{{ item.title }}</strong> <span class="muted">{{ item.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</span></p>
           <p class="pre">{{ item.body }}</p>
-          <p class="muted">收件人：{{ item.watcher_name }} ｜ 拍照人：{{ item.uploader_name }} ｜ 尾号：{{ item.order_suffix }} ｜ 单号：{{ item.matched_order_no }}</p>
           <img class="photo" src="{{ url_for('uploaded_file', filename=item.image_filename) }}" alt="提醒关联图片 {{ item.image_filename }}" loading="lazy">
           {% if not item.is_read %}
             <form method="post" action="{{ url_for('mark_notification_read', notification_id=item.id) }}">
@@ -98,20 +72,31 @@
 </section>
 
 <section class="card">
-  <h2>今日日志（{{ today }}）</h2>
-  {% if today_logs %}
-    <div class="grid">
-      {% for log in today_logs %}
-        <article class="panel">
-          <p><strong>拍照人：</strong>{{ log.uploader_name }}</p>
-          <p class="muted">时间：{{ log.created_at.strftime('%H:%M:%S') }}</p>
-          <p><strong>识别单号：</strong>{{ log.recognized_order_no or '未识别到有效单号' }}</p>
-          <img class="photo" src="{{ url_for('uploaded_file', filename=log.image_filename) }}" alt="上传图片 {{ log.image_filename }}" loading="lazy">
-        </article>
+  <h2>已设置提醒（下拉查看）</h2>
+  {% if reminders %}
+    <ul class="list">
+      {% for reminder in reminders %}
+        <li>
+          <div>
+            <p><strong>尾号 {{ reminder.order_suffix }}</strong></p>
+            {% if reminder.item_name %}
+              <p class="muted">物品：{{ reminder.item_name }}</p>
+            {% else %}
+              <p class="muted">物品：未填写</p>
+            {% endif %}
+          </div>
+          <form method="post" action="{{ url_for('toggle_reminder', reminder_id=reminder.id) }}">
+            {% if reminder.is_active %}
+              <button type="submit" class="btn-lite">停用</button>
+            {% else %}
+              <button type="submit" class="btn-lite">启用</button>
+            {% endif %}
+          </form>
+        </li>
       {% endfor %}
-    </div>
+    </ul>
   {% else %}
-    <p class="muted">今天还没有拍照记录。</p>
+    <p class="muted">还没有设置提醒。</p>
   {% endif %}
 </section>
 {% endblock %}

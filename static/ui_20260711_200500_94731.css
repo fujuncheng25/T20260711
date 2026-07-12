@@ -78,6 +78,41 @@ body {
   margin-bottom: 14px;
 }
 
+.message-bar {
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.message-bar-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.message-bar-head h2 {
+  margin-bottom: 0;
+}
+
+.msg-list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.msg-list li {
+  margin: 4px 0;
+}
+
+.search-results {
+  margin-top: 12px;
+}
+
+.search-results .panel {
+  display: grid;
+  gap: 4px;
+}
+
 .core-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -87,6 +122,11 @@ body {
 
 .core-card {
   margin-bottom: 0;
+}
+
+.camera-card,
+.reminder-card {
+  min-height: 220px;
 }
 
 h2,
@@ -109,6 +149,16 @@ h4 {
   display: grid;
   gap: 10px;
   margin-top: 10px;
+}
+
+.compact-form {
+  max-width: 300px;
+}
+
+.camera-form {
+  min-height: 160px;
+  display: grid;
+  place-items: center;
 }
 
 label {
@@ -150,9 +200,17 @@ button,
   color: var(--green-dark);
 }
 
-.big-button {
-  padding: 11px 14px;
-  font-size: 1rem;
+.camera-circle {
+  width: 112px;
+  height: 112px;
+  border-radius: 999px;
+  border: 2px solid var(--green-dark);
+  background: var(--green);
+  color: #fff;
+  font-size: 2rem;
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
 }
 
 .auth-card {
@@ -260,5 +318,9 @@ button,
 
   .list li {
     flex-direction: column;
+  }
+
+  .message-bar-head {
+    align-items: stretch;
   }
 }
