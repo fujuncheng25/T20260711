@@ -20,6 +20,57 @@
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
 
+  const localTimeFormatters = {
+    time: new Intl.DateTimeFormat(undefined, {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }),
+    datetime: new Intl.DateTimeFormat(undefined, {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    }),
+  };
+
+  const parseUtcMoment = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) {
+      return null;
+    }
+
+    const hasTimezone = /([zZ]|[+-]\d{2}:\d{2})$/.test(raw);
+    const normalized = hasTimezone ? raw : `${raw}Z`;
+    const moment = new Date(normalized);
+    if (Number.isNaN(moment.getTime())) {
+      return null;
+    }
+    return moment;
+  };
+
+  const formatLocalTime = (value, mode = 'datetime', fallback = '') => {
+    const moment = parseUtcMoment(value);
+    if (!moment) {
+      return String(fallback || '');
+    }
+
+    const formatter = localTimeFormatters[mode] || localTimeFormatters.datetime;
+    return formatter.format(moment);
+  };
+
+  const renderLocalTimes = (root = document) => {
+    const nodes = root.querySelectorAll('.js-local-time[data-utc]');
+    nodes.forEach((node) => {
+      const mode = node.dataset.timeFormat || 'datetime';
+      const fallback = node.textContent || '';
+      node.textContent = formatLocalTime(node.dataset.utc, mode, fallback);
+    });
+  };
+
   const sleep = (ms) => new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
@@ -486,6 +537,8 @@
     }, 3600);
   }
 
+  renderLocalTimes();
+
   const cameraButton = document.getElementById('camera-button');
   const pickupInput = document.getElementById('pickup-image-input');
   const cameraForm = document.getElementById('camera-form');
@@ -620,8 +673,9 @@
       if (!messageList) {
         return;
       }
+      const localTime = formatLocalTime(item.created_at_utc || item.created_at, 'time', item.created_at || '--:--');
       const row = document.createElement('li');
-      row.innerHTML = `<strong>${escapeHtml(item.created_at || '--:--')}</strong> <span>${escapeHtml(item.title || '快递到了')}</span>`;
+      row.innerHTML = `<strong>${escapeHtml(localTime)}</strong> <span>${escapeHtml(item.title || '快递到了')}</span>`;
       messageList.prepend(row);
       while (messageList.children.length > 8) {
         messageList.removeChild(messageList.lastElementChild);
@@ -684,11 +738,12 @@
 
       const html = items.map((item) => {
         const score = Number(item.score || 0) * 100;
+        const localTime = formatLocalTime(item.created_at_utc || item.created_at, 'datetime', item.created_at || '');
         return `
           <li class="panel">
             <p><strong>单号：${escapeHtml(item.order_no || '')}</strong></p>
             <p class="muted">LCS=${escapeHtml(item.lcs || 0)}，匹配度=${score.toFixed(2)}%</p>
-            <p class="muted">拍照人：${escapeHtml(item.uploader_name || '')}，时间：${escapeHtml(item.created_at || '')}</p>
+            <p class="muted">拍照人：${escapeHtml(item.uploader_name || '')}，时间：${escapeHtml(localTime)}</p>
             <img class="photo" src="${escapeHtml(item.image_url || '')}" alt="上传图片" loading="lazy">
           </li>
         `;

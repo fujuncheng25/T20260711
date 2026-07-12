@@ -75,7 +75,7 @@
                 <article class="reminder-row {% if not reminder.is_active %}is-off{% endif %}">
                   <div>
                     <p>尾号 {{ reminder.order_suffix }} · {{ reminder.custom_message }}</p>
-                    <small>{{ reminder.created_at.strftime('%Y-%m-%d %H:%M') }} · {% if reminder.is_active %}启用中{% else %}已停用{% endif %}</small>
+                    <small><span class="js-local-time" data-utc="{{ to_utc_iso(reminder.created_at) }}" data-time-format="datetime">{{ reminder.created_at.strftime('%Y-%m-%d %H:%M') }}</span> · {% if reminder.is_active %}启用中{% else %}已停用{% endif %}</small>
                   </div>
                   <form method="post" action="{{ url_for('toggle_reminder', reminder_id=reminder.id) }}">
                     <button type="submit" class="btn-ghost small">{% if reminder.is_active %}停用{% else %}启用{% endif %}</button>
@@ -114,7 +114,7 @@
         <li class="note-item {% if not note.is_read %}unread{% endif %}">
           <strong>{{ note.title }}</strong>
           <p>{{ note.body }}</p>
-          <small>{{ note.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</small>
+          <small><span class="js-local-time" data-utc="{{ to_utc_iso(note.created_at) }}" data-time-format="datetime">{{ note.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</span></small>
         </li>
       {% endfor %}
     </ul>

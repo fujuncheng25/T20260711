@@ -21,7 +21,7 @@
           {% set display_title = item.body.split('\n')[0] %}
         {% endif %}
         <li>
-          <strong>{{ item.created_at.strftime('%H:%M') }}</strong>
+          <strong class="js-local-time" data-utc="{{ to_utc_iso(item.created_at) }}" data-time-format="time">{{ item.created_at.strftime('%H:%M') }}</strong>
           <span>{{ display_title }}</span>
         </li>
       {% endfor %}
@@ -74,7 +74,10 @@
     <ul class="notes">
       {% for item in notifications %}
         <li class="panel {% if not item.is_read %}unread{% endif %}">
-          <p><strong>{{ item.title }}</strong> <span class="muted">{{ item.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</span></p>
+          <p>
+            <strong>{{ item.title }}</strong>
+            <span class="muted js-local-time" data-utc="{{ to_utc_iso(item.created_at) }}" data-time-format="datetime">{{ item.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</span>
+          </p>
           <p class="pre">{{ item.body }}</p>
           <img class="photo" src="{{ url_for('uploaded_file', filename=item.image_filename) }}" alt="提醒关联图片 {{ item.image_filename }}" loading="lazy">
           {% if not item.is_read %}

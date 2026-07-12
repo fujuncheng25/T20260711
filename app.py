@@ -51,7 +51,7 @@ SQLITE_HEADER = b"SQLite format 3\x00"
 PORT = int(os.getenv("PORT", "5000"))
 MAX_CONTENT_LENGTH_BYTES = 300 * 1024 * 1024
 
-UI_BUILD_ID = "20260712_060000_cache3m"
+UI_BUILD_ID = "20260712_073000_localtime"
 UI_CSS_FILE = "ui_20260711_200500_94731.css"
 UI_JS_FILE = "ui_20260711_200500_94731.js"
 SW_JS_FILE = "sw_20260712_050000_localcache.js"
@@ -205,6 +205,18 @@ def clean_text(value: object) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def to_utc_iso(value: object) -> str:
+    if not isinstance(value, dt.datetime):
+        return ""
+
+    moment = value
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=dt.timezone.utc)
+    else:
+        moment = moment.astimezone(dt.timezone.utc)
+    return moment.isoformat().replace("+00:00", "Z")
 
 
 def quote_identifier(name: str) -> str:
@@ -827,6 +839,7 @@ def inject_template_context() -> dict[str, object]:
         "ui_build_id": UI_BUILD_ID,
         "ui_css_file": UI_CSS_FILE,
         "ui_js_file": UI_JS_FILE,
+        "to_utc_iso": to_utc_iso,
         "bandwidth_saver_mode": BANDWIDTH_SAVER_MODE,
         "is_super_admin": is_loopback_request() if request else False,
         "current_user": getattr(g, "current_user", None),
@@ -1414,6 +1427,7 @@ def poll_notifications():
                 "body": preview,
                 "order_suffix": clean_text(row.order_suffix),
                 "created_at": row.created_at.strftime("%H:%M:%S"),
+                "created_at_utc": to_utc_iso(row.created_at),
             }
         )
 
@@ -1464,6 +1478,7 @@ def api_search_orders():
             "score": round(float(item["score"]), 4),
             "uploader_name": cast(PickupLog, item["log"]).uploader_name,
             "created_at": cast(PickupLog, item["log"]).created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "created_at_utc": to_utc_iso(cast(PickupLog, item["log"]).created_at),
             "image_url": url_for("uploaded_file", filename=cast(PickupLog, item["log"]).image_filename),
         }
         for item in ranked

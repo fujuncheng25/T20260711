@@ -18,7 +18,7 @@
         <li class="note-item {% if not note.is_read %}unread{% endif %}">
           <strong>{{ note.title }}</strong>
           <p>{{ note.body }}</p>
-          <small>{{ note.created_at.strftime('%Y-%m-%d %H:%M:%S') }} · {% if note.is_read %}已读{% else %}未读{% endif %}</small>
+          <small><span class="js-local-time" data-utc="{{ to_utc_iso(note.created_at) }}" data-time-format="datetime">{{ note.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</span> · {% if note.is_read %}已读{% else %}未读{% endif %}</small>
         </li>
       {% endfor %}
     </ul>

@@ -1,4 +1,4 @@
-const CACHE_NAME = "tmall-local-static-v20260712-050000";
+const CACHE_NAME = "tmall-local-static-v20260712-073000";
 const RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 
 function shouldCacheRequest(request) {
