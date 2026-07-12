@@ -346,6 +346,40 @@ def extract_order_candidates(recognized_parts: Iterable[str]) -> list[str]:
     return sorted(candidates.keys(), key=lambda item: (-len(item), item))
 
 
+def merge_order_candidates(*candidate_groups: Iterable[str]) -> list[str]:
+    merged: dict[str, bool] = {}
+    for group in candidate_groups:
+        for raw_candidate in group:
+            candidate = normalize_token(raw_candidate)
+            if len(candidate) < 8:
+                continue
+            if sum(char.isdigit() for char in candidate) < 6:
+                continue
+            merged[candidate] = True
+    return sorted(merged.keys(), key=lambda item: (-len(item), item))
+
+
+def serialize_order_candidates(candidates: Iterable[str], max_items: int = 8, max_chars: int = 80) -> str:
+    serialized: list[str] = []
+    for raw_candidate in candidates:
+        candidate = normalize_token(raw_candidate)
+        if len(candidate) < 8:
+            continue
+        if sum(char.isdigit() for char in candidate) < 6:
+            continue
+        if candidate in serialized:
+            continue
+        if len(serialized) >= max_items:
+            break
+
+        preview = " | ".join(serialized + [candidate])
+        if serialized and len(preview) > max_chars:
+            break
+        serialized.append(candidate)
+
+    return " | ".join(serialized)
+
+
 def suffix_matches(candidate: str, suffix: str) -> bool:
     if candidate.endswith(suffix):
         return True
@@ -384,22 +418,45 @@ def rank_pickup_logs_by_lcs(logs: Iterable[PickupLog], query: str, limit: int = 
 
     scored: list[dict[str, object]] = []
     for log in logs:
-        order_no = clean_text(getattr(log, "recognized_order_no", ""))
-        normalized_order_no = normalize_token(order_no)
-        if not normalized_order_no:
+        stored_order_text = clean_text(getattr(log, "recognized_order_no", ""))
+        log_candidates = extract_order_candidates([stored_order_text])
+        if not log_candidates and stored_order_text:
+            fallback = normalize_token(stored_order_text)
+            if fallback:
+                log_candidates = [fallback]
+
+        best_order_no = ""
+        best_lcs = 0
+        best_score = 0.0
+
+        for order_no in log_candidates:
+            normalized_order_no = normalize_token(order_no)
+            if not normalized_order_no:
+                continue
+
+            lcs = lcs_length(normalized_query, normalized_order_no)
+            if lcs <= 0:
+                continue
+
+            score = lcs / max(len(normalized_query), len(normalized_order_no))
+            if (
+                lcs > best_lcs
+                or (lcs == best_lcs and score > best_score)
+                or (lcs == best_lcs and score == best_score and len(order_no) > len(best_order_no))
+            ):
+                best_order_no = order_no
+                best_lcs = lcs
+                best_score = score
+
+        if not best_order_no:
             continue
 
-        lcs = lcs_length(normalized_query, normalized_order_no)
-        if lcs <= 0:
-            continue
-
-        score = lcs / max(len(normalized_query), len(normalized_order_no))
         scored.append(
             {
                 "log": log,
-                "order_no": order_no,
-                "lcs": int(lcs),
-                "score": float(score),
+                "order_no": best_order_no,
+                "lcs": int(best_lcs),
+                "score": float(best_score),
             }
         )
 
@@ -693,6 +750,19 @@ def create_notifications_for_candidates(
                 continue
             group_recipient_map.setdefault(int(row[0]), []).append(str(row[1]))
 
+    existing_notification_rows = db_session.execute(
+        select(Notification.reminder_id, Notification.watcher_name, Notification.matched_order_no)
+        .where(Notification.pickup_log_id == pickup_log.id)
+    ).all()
+    existing_notification_keys = {
+        (
+            int(row[0]),
+            clean_text(row[1]),
+            normalize_token(row[2]),
+        )
+        for row in existing_notification_rows
+    }
+
     matched_rules = 0
     notification_count = 0
 
@@ -726,6 +796,10 @@ def create_notifications_for_candidates(
         headline = f"{item_name} 到了" if item_name else (custom_message or "快递到了")
 
         for recipient in sorted(recipients):
+            dedupe_key = (int(rule.id), recipient, normalize_token(matched_candidate))
+            if dedupe_key in existing_notification_keys:
+                continue
+
             title = headline
             body = (
                 f"{headline}\n"
@@ -749,6 +823,7 @@ def create_notifications_for_candidates(
                     is_read=False,
                 )
             )
+            existing_notification_keys.add(dedupe_key)
             notification_count += 1
 
     return matched_rules, notification_count
@@ -1053,7 +1128,7 @@ def scan_and_record():
         uploader_name=uploader_name,
         image_filename=unique_filename,
         extracted_text=extracted_text,
-        recognized_order_no=(candidates[0] if candidates else ""),
+        recognized_order_no=serialize_order_candidates(candidates),
     )
     g.db.add(pickup_log)
     g.db.flush()
@@ -1105,7 +1180,7 @@ def staged_scan_init():
             uploader_name=uploader_name,
             image_filename=thumbnail_filename,
             extracted_text=extracted_text,
-            recognized_order_no=(candidates[0] if candidates else ""),
+            recognized_order_no=serialize_order_candidates(candidates),
         )
         g.db.add(pickup_log)
         g.db.flush()
@@ -1127,6 +1202,7 @@ def staged_scan_init():
             "ok": True,
             "pickup_log_id": int(pickup_log.id),
             "recognized_order_no": pickup_log.recognized_order_no,
+            "recognized_order_candidates": candidates,
             "candidate_count": len(candidates),
             "matched_rules": matched_rules,
             "notifications_created": notification_count,
@@ -1161,6 +1237,9 @@ def staged_scan_finalize():
     unique_filename = build_unique_upload_filename(uploaded.filename, prefix="full_")
     image_path = UPLOAD_DIR / unique_filename
     old_filename = clean_text(pickup_log.image_filename)
+    merged_candidates: list[str] = []
+    matched_rules = 0
+    notification_count = 0
 
     try:
         uploaded.save(image_path)
@@ -1171,33 +1250,38 @@ def staged_scan_finalize():
         for row in notification_rows:
             row.image_filename = unique_filename
 
-        # Fallback to server OCR only when local-first stage did not yield enough signal.
-        need_fallback_scan = (not notification_rows) or (not clean_text(pickup_log.recognized_order_no))
-        fallback_candidates: list[str] = []
-        fallback_extracted_text = ""
-        matched_rules = 0
-        notification_count = 0
+        server_candidates: list[str] = []
+        server_extracted_text = ""
+        try:
+            server_candidates, _, _, server_extracted_text = analyze_pickup_image(image_path)
+        except Exception:
+            server_candidates = []
+            server_extracted_text = ""
 
-        if need_fallback_scan:
-            try:
-                fallback_candidates, _, _, fallback_extracted_text = analyze_pickup_image(image_path)
-            except Exception:
-                fallback_candidates = []
-                fallback_extracted_text = ""
+        local_candidates = extract_order_candidates(
+            [
+                clean_text(pickup_log.recognized_order_no),
+                clean_text(pickup_log.extracted_text),
+            ]
+        )
+        merged_candidates = merge_order_candidates(local_candidates, server_candidates)
+        if merged_candidates:
+            pickup_log.recognized_order_no = serialize_order_candidates(merged_candidates)
 
-            if fallback_extracted_text and not clean_text(pickup_log.extracted_text):
-                pickup_log.extracted_text = fallback_extracted_text
+        merged_extracted_lines = merge_unique_lines(
+            clean_text(pickup_log.extracted_text).splitlines()
+            + clean_text(server_extracted_text).splitlines()
+            + merged_candidates
+        )
+        pickup_log.extracted_text = "\n".join(merged_extracted_lines)
 
-            if fallback_candidates and not clean_text(pickup_log.recognized_order_no):
-                pickup_log.recognized_order_no = fallback_candidates[0]
-
-            if fallback_candidates and not notification_rows:
-                matched_rules, notification_count = create_notifications_for_candidates(
-                    g.db,
-                    pickup_log,
-                    pickup_log.uploader_name,
-                    fallback_candidates,
-                )
+        if merged_candidates:
+            matched_rules, notification_count = create_notifications_for_candidates(
+                g.db,
+                pickup_log,
+                pickup_log.uploader_name,
+                merged_candidates,
+            )
 
         g.db.commit()
     except Exception:
@@ -1213,6 +1297,9 @@ def staged_scan_finalize():
             "ok": True,
             "pickup_log_id": int(pickup_log.id),
             "image_filename": unique_filename,
+            "recognized_order_no": pickup_log.recognized_order_no,
+            "recognized_order_candidates": merged_candidates,
+            "candidate_count": len(merged_candidates),
             "fallback_matched_rules": matched_rules,
             "fallback_notifications_created": notification_count,
         }

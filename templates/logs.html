@@ -42,6 +42,7 @@
           <p><strong>拍照人：</strong>{{ log.uploader_name }}</p>
           <p class="muted">时间：<span class="js-local-time" data-utc="{{ to_utc_iso(log.created_at) }}" data-time-format="datetime">{{ log.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</span></p>
           <p><strong>识别单号：</strong>{{ log.recognized_order_no or '未识别到有效单号' }}</p>
+          <p class="muted">同一张图支持多个单号，使用 | 分隔显示。</p>
           <img class="photo" src="{{ url_for('uploaded_file', filename=log.image_filename) }}" alt="上传图片 {{ log.image_filename }}" loading="lazy">
         </article>
       {% endfor %}

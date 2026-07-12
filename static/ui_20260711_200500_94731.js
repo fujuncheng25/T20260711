@@ -381,7 +381,14 @@
 
   const makeQueueCardHtml = (item) => {
     const stageLabel = stageLabels[item.stage] || item.stage;
-    const orderNo = item.recognizedOrderNo ? `，单号 ${escapeHtml(item.recognizedOrderNo)}` : '';
+    const candidates = Array.isArray(item.recognizedCandidates)
+      ? item.recognizedCandidates.filter((row) => String(row || '').trim().length > 0)
+      : [];
+    const previewCandidates = candidates.slice(0, 3).map((row) => escapeHtml(row));
+    const candidateSuffix = candidates.length > 3 ? ` 等${candidates.length}个` : '';
+    const orderNo = previewCandidates.length > 0
+      ? `，单号 ${previewCandidates.join(' / ')}${candidateSuffix}`
+      : (item.recognizedOrderNo ? `，单号 ${escapeHtml(item.recognizedOrderNo)}` : '');
     const errorText = item.lastError ? `<span class="queue-error">${escapeHtml(item.lastError)}</span>` : '';
     return `
       <li class="queue-item queue-${escapeHtml(item.stage || 'queued')}">
@@ -482,7 +489,10 @@
               stage: 'initDone',
               initResponse: initPayload,
               pickupLogId: Number(initPayload.pickup_log_id || 0) || null,
-              recognizedOrderNo: current.recognizedOrderNo || String(initPayload.recognized_order_no || ''),
+              recognizedCandidates: Array.isArray(initPayload.recognized_order_candidates)
+                ? initPayload.recognized_order_candidates
+                : current.recognizedCandidates,
+              recognizedOrderNo: String(initPayload.recognized_order_no || current.recognizedOrderNo || ''),
             });
             current = ensureQueueItem((await getQueueItem(current.id)) || current);
           }
