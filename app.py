@@ -51,7 +51,7 @@ SQLITE_HEADER = b"SQLite format 3\x00"
 PORT = int(os.getenv("PORT", "5000"))
 MAX_CONTENT_LENGTH_BYTES = 300 * 1024 * 1024
 
-UI_BUILD_ID = "20260712_081500_swipefix"
+UI_BUILD_ID = "20260712_093500_frontend_hint"
 UI_CSS_FILE = "ui_20260711_200500_94731.css"
 UI_JS_FILE = "ui_20260711_200500_94731.js"
 SW_JS_FILE = "sw_20260712_050000_localcache.js"
@@ -870,6 +870,54 @@ def list_groups_for_user(db_session, user_id: int) -> list[dict[str, object]]:
     return [{"id": int(row[0]), "name": str(row[1])} for row in rows]
 
 
+def build_frontend_reminder_snapshot(db_session) -> list[dict[str, object]]:
+    reminder_rules = db_session.scalars(
+        select(ReminderRule)
+        .where(ReminderRule.is_active.is_(True))
+        .order_by(ReminderRule.created_at.asc(), ReminderRule.id.asc())
+    ).all()
+
+    watcher_names = sorted({clean_text(rule.watcher_name) for rule in reminder_rules if clean_text(rule.watcher_name)})
+    watcher_rows = []
+    if watcher_names:
+        watcher_rows = db_session.execute(
+            select(User.id, User.username).where(User.username.in_(watcher_names))
+        ).all()
+
+    watcher_id_by_name = {str(row[1]): int(row[0]) for row in watcher_rows}
+    watcher_ids = [int(row[0]) for row in watcher_rows]
+
+    groups_by_user: dict[int, list[str]] = {}
+    if watcher_ids:
+        group_rows = db_session.execute(
+            select(GroupMember.user_id, UserGroup.name)
+            .join(UserGroup, UserGroup.id == GroupMember.group_id)
+            .where(GroupMember.user_id.in_(watcher_ids))
+            .order_by(GroupMember.user_id.asc(), UserGroup.name.asc())
+        ).all()
+        for row in group_rows:
+            groups_by_user.setdefault(int(row[0]), []).append(str(row[1]))
+
+    snapshot: list[dict[str, object]] = []
+    for rule in reminder_rules:
+        watcher_name = clean_text(rule.watcher_name)
+        if not watcher_name:
+            continue
+
+        watcher_id = watcher_id_by_name.get(watcher_name)
+        group_names = groups_by_user.get(watcher_id, []) if watcher_id is not None else []
+
+        snapshot.append(
+            {
+                "watcher_name": watcher_name,
+                "order_suffix": digits_only(clean_text(rule.order_suffix)),
+                "group_names": [group_name for group_name in group_names if clean_text(group_name)],
+            }
+        )
+
+    return snapshot
+
+
 @app.before_request
 def open_db_session():
     g.db = SessionLocal()
@@ -1040,6 +1088,7 @@ def index():
     unread = [item for item in notifications if not item.is_read]
     recent_notifications = unread[:8] if unread else notifications[:8]
     latest_notification_id = int(notifications[0].id) if notifications else 0
+    frontend_reminder_snapshot = build_frontend_reminder_snapshot(db_session)
 
     return render_template(
         "index.html",
@@ -1048,6 +1097,7 @@ def index():
         recent_notifications=recent_notifications,
         latest_notification_id=latest_notification_id,
         default_reminder_message=DEFAULT_REMINDER_MESSAGE,
+        frontend_reminder_snapshot=frontend_reminder_snapshot,
     )
 
 

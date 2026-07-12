@@ -197,6 +197,7 @@
     recognizedCandidates: [],
     recognizedTextLines: [],
     recognizedOrderNo: '',
+    localMatchHint: null,
     initResponse: null,
     pickupLogId: null,
     ...raw,
@@ -379,6 +380,96 @@
     return { lines, candidates };
   };
 
+  const extractDigits = (value) => String(value || '').replace(/\D/g, '');
+
+  const localSuffixMatches = (candidate, suffix) => {
+    const normalizedCandidate = String(candidate || '').trim().toUpperCase();
+    const normalizedSuffix = String(suffix || '').trim();
+    if (!normalizedCandidate || !normalizedSuffix) {
+      return false;
+    }
+
+    if (normalizedCandidate.endsWith(normalizedSuffix)) {
+      return true;
+    }
+
+    const suffixDigits = extractDigits(normalizedSuffix);
+    if (suffixDigits.length < 4) {
+      return false;
+    }
+    return extractDigits(normalizedCandidate).endsWith(suffixDigits);
+  };
+
+  const parseFrontendReminderSnapshot = () => {
+    const node = document.getElementById('frontend-reminder-snapshot');
+    if (!node) {
+      return [];
+    }
+
+    try {
+      const parsed = JSON.parse(node.textContent || '[]');
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+
+      return parsed
+        .map((row) => {
+          const watcherName = String((row && row.watcher_name) || '').trim();
+          const orderSuffix = extractDigits((row && row.order_suffix) || '');
+          const groupNames = Array.isArray(row && row.group_names)
+            ? row.group_names
+              .map((groupName) => String(groupName || '').trim())
+              .filter((groupName) => groupName.length > 0)
+            : [];
+
+          return {
+            watcherName,
+            orderSuffix,
+            groupNames,
+          };
+        })
+        .filter((row) => row.watcherName.length > 0 && row.orderSuffix.length >= 4);
+    } catch (error) {
+      console.error(error);
+      return [];
+    }
+  };
+
+  const frontendReminderSnapshot = parseFrontendReminderSnapshot();
+
+  const pickFrontendMatchHint = (candidates) => {
+    if (!Array.isArray(candidates) || candidates.length === 0) {
+      return null;
+    }
+    if (frontendReminderSnapshot.length === 0) {
+      return null;
+    }
+
+    const hits = [];
+    frontendReminderSnapshot.forEach((rule) => {
+      const matchedCandidate = candidates.find((candidate) => localSuffixMatches(candidate, rule.orderSuffix));
+      if (!matchedCandidate) {
+        return;
+      }
+
+      const groupCandidates = rule.groupNames.length > 0 ? rule.groupNames : ['个人'];
+      groupCandidates.forEach((groupName) => {
+        hits.push({
+          watcherName: rule.watcherName,
+          groupName,
+          orderSuffix: rule.orderSuffix,
+          candidate: String(matchedCandidate || ''),
+        });
+      });
+    });
+
+    if (hits.length === 0) {
+      return null;
+    }
+
+    return hits[Math.floor(Math.random() * hits.length)];
+  };
+
   const makeQueueCardHtml = (item) => {
     const stageLabel = stageLabels[item.stage] || item.stage;
     const candidates = Array.isArray(item.recognizedCandidates)
@@ -389,11 +480,17 @@
     const orderNo = previewCandidates.length > 0
       ? `，单号 ${previewCandidates.join(' / ')}${candidateSuffix}`
       : (item.recognizedOrderNo ? `，单号 ${escapeHtml(item.recognizedOrderNo)}` : '');
+    const hint = item.localMatchHint && typeof item.localMatchHint === 'object'
+      ? item.localMatchHint
+      : null;
+    const hintText = hint && hint.watcherName
+      ? `，前端预判 ${escapeHtml(hint.groupName || '个人')} / ${escapeHtml(hint.watcherName)}`
+      : '';
     const errorText = item.lastError ? `<span class="queue-error">${escapeHtml(item.lastError)}</span>` : '';
     return `
       <li class="queue-item queue-${escapeHtml(item.stage || 'queued')}">
         <strong>${escapeHtml(new Date(item.createdAt || Date.now()).toLocaleTimeString())}</strong>
-        <span>${escapeHtml(stageLabel)}${orderNo}</span>
+        <span>${escapeHtml(stageLabel)}${orderNo}${hintText}</span>
         ${errorText}
       </li>
     `;
@@ -462,6 +559,7 @@
             const recognizedCandidates = Array.isArray(localResult.candidates) ? localResult.candidates : [];
             const recognizedTextLines = Array.isArray(localResult.lines) ? localResult.lines : [];
             const recognizedOrderNo = recognizedCandidates[0] || '';
+            const localMatchHint = pickFrontendMatchHint(recognizedCandidates);
             const thumbnailDataUrl = await compressImageDataUrl(current.originalDataUrl, 2048);
 
             await updateQueueItem(current.id, {
@@ -470,6 +568,7 @@
               recognizedCandidates,
               recognizedTextLines,
               recognizedOrderNo,
+              localMatchHint,
             });
             current = ensureQueueItem((await getQueueItem(current.id)) || current);
 
@@ -485,14 +584,17 @@
               }),
             });
 
+            const mergedCandidates = Array.isArray(initPayload.recognized_order_candidates)
+              ? initPayload.recognized_order_candidates
+              : current.recognizedCandidates;
+
             await updateQueueItem(current.id, {
               stage: 'initDone',
               initResponse: initPayload,
               pickupLogId: Number(initPayload.pickup_log_id || 0) || null,
-              recognizedCandidates: Array.isArray(initPayload.recognized_order_candidates)
-                ? initPayload.recognized_order_candidates
-                : current.recognizedCandidates,
+              recognizedCandidates: mergedCandidates,
               recognizedOrderNo: String(initPayload.recognized_order_no || current.recognizedOrderNo || ''),
+              localMatchHint: pickFrontendMatchHint(mergedCandidates),
             });
             current = ensureQueueItem((await getQueueItem(current.id)) || current);
           }
