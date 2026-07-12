@@ -2,13 +2,21 @@
 {% block title %}首页 - 物流拍照提醒站{% endblock %}
 {% block content %}
 <section class="card message-bar">
-  <h2>消息栏</h2>
+  <div class="message-bar-head">
+    <h2>消息栏</h2>
+    <button id="enable-browser-notify" type="button" class="btn-lite">开启系统通知</button>
+  </div>
+  <div id="notification-poll-anchor" data-poll-url="{{ url_for('poll_notifications') }}" data-initial-id="{{ latest_notification_id }}" hidden></div>
   {% if recent_notifications %}
     <ul class="msg-list">
       {% for item in recent_notifications %}
+        {% set display_title = item.title %}
+        {% if '的快递提醒' in display_title and item.body %}
+          {% set display_title = item.body.split('\n')[0] %}
+        {% endif %}
         <li>
           <strong>{{ item.created_at.strftime('%H:%M') }}</strong>
-          <span>{{ item.title }}（尾号 {{ item.order_suffix }}）</span>
+          <span>{{ display_title }}</span>
         </li>
       {% endfor %}
     </ul>
@@ -89,24 +97,6 @@
     </ul>
   {% else %}
     <p class="muted">还没有设置提醒。</p>
-  {% endif %}
-</section>
-
-<section class="card">
-  <h2>今日日志（{{ today }}）</h2>
-  {% if today_logs %}
-    <div class="grid">
-      {% for log in today_logs %}
-        <article class="panel">
-          <p><strong>拍照人：</strong>{{ log.uploader_name }}</p>
-          <p class="muted">时间：{{ log.created_at.strftime('%H:%M:%S') }}</p>
-          <p><strong>识别单号：</strong>{{ log.recognized_order_no or '未识别到有效单号' }}</p>
-          <img class="photo" src="{{ url_for('uploaded_file', filename=log.image_filename) }}" alt="上传图片 {{ log.image_filename }}" loading="lazy">
-        </article>
-      {% endfor %}
-    </div>
-  {% else %}
-    <p class="muted">今天还没有拍照记录。</p>
   {% endif %}
 </section>
 {% endblock %}

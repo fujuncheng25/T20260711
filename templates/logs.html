@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}日志与搜索{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>快递单号搜索（LCS）</h2>
+  <form method="get" action="{{ url_for('logs_page') }}" class="form compact-form" id="order-search-form">
+    <label>
+      输入单号片段
+      <input id="order-search-input" type="text" name="q" value="{{ search_query }}" placeholder="例如：78451290" autocomplete="off">
+    </label>
+    <button type="submit">搜索</button>
+  </form>
+  <p class="muted">输入后会自动按最长公共子序列匹配最像的单号。</p>
+
+  <ul id="search-result-list" class="notes search-results" data-search-url="{{ url_for('api_search_orders') }}">
+    {% if search_results %}
+      {% for item in search_results %}
+        <li class="panel">
+          <p><strong>单号：{{ item.order_no }}</strong></p>
+          <p class="muted">LCS={{ item.lcs }}，匹配度={{ '%.2f'|format(item.score * 100) }}%</p>
+          <p class="muted">拍照人：{{ item.log.uploader_name }}，时间：{{ item.log.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</p>
+          <img class="photo" src="{{ url_for('uploaded_file', filename=item.log.image_filename) }}" alt="上传图片 {{ item.log.image_filename }}" loading="lazy">
+        </li>
+      {% endfor %}
+    {% elif search_query %}
+      <li class="panel muted">没有找到匹配结果。</li>
+    {% else %}
+      <li class="panel muted">请在上方输入单号片段开始搜索。</li>
+    {% endif %}
+  </ul>
+</section>
+
+<section class="card">
+  <h2>最近拍照日志</h2>
+  {% if logs %}
+    <div class="grid">
+      {% for log in logs %}
+        <article class="panel">
+          <p><strong>拍照人：</strong>{{ log.uploader_name }}</p>
+          <p class="muted">时间：{{ log.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</p>
+          <p><strong>识别单号：</strong>{{ log.recognized_order_no or '未识别到有效单号' }}</p>
+          <img class="photo" src="{{ url_for('uploaded_file', filename=log.image_filename) }}" alt="上传图片 {{ log.image_filename }}" loading="lazy">
+        </article>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="muted">暂无拍照日志。</p>
+  {% endif %}
+</section>
+{% endblock %}

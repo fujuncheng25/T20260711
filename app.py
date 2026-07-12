@@ -11,7 +11,7 @@ import threading
 import uuid
 from functools import wraps
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, cast
 
 import numpy as np
 from flask import (
@@ -19,6 +19,7 @@ from flask import (
     abort,
     flash,
     g,
+    jsonify,
     redirect,
     render_template,
     request,
@@ -329,6 +330,64 @@ def suffix_matches(candidate: str, suffix: str) -> bool:
     if len(suffix_digits) < 4:
         return False
     return digits_only(candidate).endswith(suffix_digits)
+
+
+def lcs_length(left: str, right: str) -> int:
+    left = normalize_token(left)
+    right = normalize_token(right)
+    if not left or not right:
+        return 0
+
+    if len(left) > len(right):
+        left, right = right, left
+
+    previous_row = [0] * (len(left) + 1)
+    for right_char in right:
+        current_row = [0]
+        for index, left_char in enumerate(left, start=1):
+            if left_char == right_char:
+                current_row.append(previous_row[index - 1] + 1)
+            else:
+                current_row.append(max(previous_row[index], current_row[index - 1]))
+        previous_row = current_row
+    return previous_row[-1]
+
+
+def rank_pickup_logs_by_lcs(logs: Iterable[PickupLog], query: str, limit: int = 20) -> list[dict[str, object]]:
+    normalized_query = normalize_token(query)
+    if not normalized_query:
+        return []
+
+    scored: list[dict[str, object]] = []
+    for log in logs:
+        order_no = clean_text(getattr(log, "recognized_order_no", ""))
+        normalized_order_no = normalize_token(order_no)
+        if not normalized_order_no:
+            continue
+
+        lcs = lcs_length(normalized_query, normalized_order_no)
+        if lcs <= 0:
+            continue
+
+        score = lcs / max(len(normalized_query), len(normalized_order_no))
+        scored.append(
+            {
+                "log": log,
+                "order_no": order_no,
+                "lcs": int(lcs),
+                "score": float(score),
+            }
+        )
+
+    scored.sort(
+        key=lambda item: (
+            int(item["lcs"]),
+            float(item["score"]),
+            cast(PickupLog, item["log"]).created_at,
+        ),
+        reverse=True,
+    )
+    return scored[:limit]
 
 
 def is_loopback_request() -> bool:
@@ -656,26 +715,16 @@ def index():
         .limit(300)
     ).all()
 
-    today = dt.date.today()
-    start = dt.datetime.combine(today, dt.time.min)
-    end = start + dt.timedelta(days=1)
-    today_logs = db_session.scalars(
-        select(PickupLog)
-        .where(PickupLog.created_at >= start, PickupLog.created_at < end)
-        .order_by(desc(PickupLog.created_at))
-        .limit(300)
-    ).all()
-
     unread = [item for item in notifications if not item.is_read]
     recent_notifications = unread[:8] if unread else notifications[:8]
+    latest_notification_id = int(notifications[0].id) if notifications else 0
 
     return render_template(
         "index.html",
         reminders=reminders,
         notifications=notifications,
         recent_notifications=recent_notifications,
-        today_logs=today_logs,
-        today=today,
+        latest_notification_id=latest_notification_id,
         default_reminder_message=DEFAULT_REMINDER_MESSAGE,
     )
 
@@ -839,12 +888,13 @@ def scan_and_record():
 
         item_name = clean_text(getattr(rule, "item_name", ""))
         custom_message = clean_text(rule.custom_message) or DEFAULT_REMINDER_MESSAGE
-        headline = f"{item_name} 到了" if item_name else custom_message
+        headline = f"{item_name} 到了" if item_name else (custom_message or "快递到了")
 
         for recipient in sorted(recipients):
-            title = f"{recipient} 的快递提醒"
+            title = headline
             body = (
                 f"{headline}\n"
+                f"提醒创建人: {rule.watcher_name}\n"
                 f"拍照人: {uploader_name}\n"
                 f"命中尾号: {rule.order_suffix}\n"
                 f"识别单号: {matched_candidate}\n"
@@ -1053,6 +1103,96 @@ def mark_notification_read(notification_id: int):
         notification.is_read = True
         g.db.commit()
     return redirect(url_for("index"))
+
+
+@app.get("/api/notifications/poll")
+@login_required
+def poll_notifications():
+    after_id_raw = clean_text(request.args.get("after_id"))
+    try:
+        after_id = max(int(after_id_raw or "0"), 0)
+    except ValueError:
+        after_id = 0
+
+    rows = g.db.scalars(
+        select(Notification)
+        .where(
+            Notification.watcher_name == g.current_user.username,
+            Notification.id > after_id,
+        )
+        .order_by(Notification.id.asc())
+        .limit(20)
+    ).all()
+
+    max_id = after_id
+    items: list[dict[str, object]] = []
+    for row in rows:
+        max_id = max(max_id, int(row.id))
+        first_line = clean_text(row.body).splitlines()
+        preview = first_line[0] if first_line else ""
+        items.append(
+            {
+                "id": int(row.id),
+                "title": clean_text(row.title),
+                "body": preview,
+                "order_suffix": clean_text(row.order_suffix),
+                "created_at": row.created_at.strftime("%H:%M:%S"),
+            }
+        )
+
+    return jsonify({"items": items, "max_id": max_id})
+
+
+@app.get("/logs")
+@login_required
+def logs_page():
+    search_query = clean_text(request.args.get("q"))
+    logs = g.db.scalars(
+        select(PickupLog)
+        .order_by(desc(PickupLog.created_at))
+        .limit(400)
+    ).all()
+
+    search_results = rank_pickup_logs_by_lcs(logs, search_query, limit=20) if search_query else []
+
+    return render_template(
+        "logs.html",
+        logs=logs,
+        search_query=search_query,
+        search_results=search_results,
+    )
+
+
+@app.get("/api/orders/search")
+@login_required
+def api_search_orders():
+    query = clean_text(request.args.get("q"))
+    normalized_query = normalize_token(query)
+    if len(normalized_query) < 2:
+        return jsonify({"query": query, "normalized_query": normalized_query, "items": []})
+
+    logs = g.db.scalars(
+        select(PickupLog)
+        .where(PickupLog.recognized_order_no != "")
+        .order_by(desc(PickupLog.created_at))
+        .limit(600)
+    ).all()
+    ranked = rank_pickup_logs_by_lcs(logs, normalized_query, limit=20)
+
+    items = [
+        {
+            "log_id": int(cast(PickupLog, item["log"]).id),
+            "order_no": str(item["order_no"]),
+            "lcs": int(item["lcs"]),
+            "score": round(float(item["score"]), 4),
+            "uploader_name": cast(PickupLog, item["log"]).uploader_name,
+            "created_at": cast(PickupLog, item["log"]).created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "image_url": url_for("uploaded_file", filename=cast(PickupLog, item["log"]).image_filename),
+        }
+        for item in ranked
+    ]
+
+    return jsonify({"query": query, "normalized_query": normalized_query, "items": items})
 
 
 @app.get("/uploads/<path:filename>")

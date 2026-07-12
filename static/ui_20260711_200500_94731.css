@@ -83,6 +83,18 @@ body {
   padding-bottom: 10px;
 }
 
+.message-bar-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.message-bar-head h2 {
+  margin-bottom: 0;
+}
+
 .msg-list {
   margin: 0;
   padding-left: 18px;
@@ -90,6 +102,15 @@ body {
 
 .msg-list li {
   margin: 4px 0;
+}
+
+.search-results {
+  margin-top: 12px;
+}
+
+.search-results .panel {
+  display: grid;
+  gap: 4px;
 }
 
 .core-grid {
@@ -297,5 +318,9 @@ button,
 
   .list li {
     flex-direction: column;
+  }
+
+  .message-bar-head {
+    align-items: stretch;
   }
 }
