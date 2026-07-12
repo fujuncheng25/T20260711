@@ -6,7 +6,13 @@
     <h2>消息栏</h2>
     <button id="enable-browser-notify" type="button" class="btn-lite">开启系统通知</button>
   </div>
-  <div id="notification-poll-anchor" data-poll-url="{{ url_for('poll_notifications') }}" data-initial-id="{{ latest_notification_id }}" hidden></div>
+  <div
+    id="notification-poll-anchor"
+    data-poll-url="{{ url_for('poll_notifications') }}"
+    data-initial-id="{{ latest_notification_id }}"
+    data-bandwidth-saver="{{ 1 if bandwidth_saver_mode else 0 }}"
+    hidden
+  ></div>
   {% if recent_notifications %}
     <ul class="msg-list">
       {% for item in recent_notifications %}
@@ -27,10 +33,23 @@
 
 <section class="core-grid">
   <article class="card core-card camera-card">
-    <form id="camera-form" method="post" action="{{ url_for('scan_and_record') }}" enctype="multipart/form-data" class="camera-form">
-      <input id="pickup-image-input" type="file" name="pickup_image" accept="image/*" hidden required>
+    <form
+      id="camera-form"
+      method="post"
+      action="{{ url_for('scan_and_record') }}"
+      enctype="multipart/form-data"
+      class="camera-form"
+      data-staged-init-url="{{ url_for('staged_scan_init') }}"
+      data-staged-finalize-url="{{ url_for('staged_scan_finalize') }}"
+    >
+      <input id="pickup-image-input" type="file" name="pickup_image" accept="image/*" capture="environment" hidden required>
       <button id="camera-button" type="button" class="camera-circle" aria-label="拍照上传">📷</button>
     </form>
+    <div id="capture-queue-panel" class="queue-panel" aria-live="polite">
+      <p id="capture-queue-status" class="muted">本地缓存队列：0 张</p>
+      <ul id="capture-queue-list" class="queue-list"></ul>
+    </div>
+    <p class="muted">支持连续拍照：先提交单号与缩略图，再后台慢速补传原图。</p>
   </article>
 
   <article class="card core-card reminder-card">

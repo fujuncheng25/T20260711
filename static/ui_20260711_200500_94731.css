@@ -161,6 +161,46 @@ h4 {
   place-items: center;
 }
 
+.queue-panel {
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  padding: 8px;
+  background: #fbfffc;
+  width: 100%;
+}
+
+.queue-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.queue-item {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 0.88rem;
+  display: grid;
+  gap: 2px;
+  background: #fff;
+}
+
+.queue-empty {
+  color: var(--muted);
+}
+
+.queue-failed {
+  border-color: var(--danger-line);
+  background: var(--danger-bg);
+}
+
+.queue-error {
+  color: #ad2f2f;
+  font-size: 0.82rem;
+}
+
 label {
   display: grid;
   gap: 5px;

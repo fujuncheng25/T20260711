@@ -42,6 +42,15 @@
     {% block content %}{% endblock %}
   </main>
 
+  <script>
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker.register("{{ url_for('service_worker_script') }}", { scope: "/" }).catch((error) => {
+          console.error("Service worker registration failed:", error);
+        });
+      });
+    }
+  </script>
   <script src="{{ url_for('static', filename=ui_js_file) }}?v={{ ui_build_id }}" defer></script>
 </body>
 </html>

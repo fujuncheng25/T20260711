@@ -1,10 +1,479 @@
 (() => {
+  const QUEUE_DB_NAME = 'tmall-scrabber-local-queue';
+  const QUEUE_STORE_NAME = 'captures';
+  const QUEUE_DB_VERSION = 1;
+
+  const stageLabels = {
+    queued: '已缓存',
+    preparing: '本地识别中',
+    initUploading: '上传缩略图中',
+    initDone: '已提交单号和缩略图',
+    originalUploading: '上传原图中',
+    completed: '已完成',
+    failed: '上传失败，等待重试',
+  };
+
   const escapeHtml = (text) => String(text)
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
+
+  const sleep = (ms) => new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
+  const fileToArrayBuffer = (file) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error || new Error('文件读取失败'));
+    reader.readAsArrayBuffer(file);
+  });
+
+  const arrayBufferToDataUrl = (buffer, mimeType) => {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    for (let index = 0; index < bytes.byteLength; index += 1) {
+      binary += String.fromCharCode(bytes[index]);
+    }
+    return `data:${mimeType};base64,${btoa(binary)}`;
+  };
+
+  const toBlobFromDataUrl = (dataUrl) => {
+    const parts = String(dataUrl).split(',');
+    if (parts.length !== 2) {
+      throw new Error('data url 无效');
+    }
+    const mimeMatch = parts[0].match(/data:(.*?);base64/i);
+    const mimeType = mimeMatch ? mimeMatch[1] : 'image/jpeg';
+    const raw = atob(parts[1]);
+    const buffer = new Uint8Array(raw.length);
+    for (let index = 0; index < raw.length; index += 1) {
+      buffer[index] = raw.charCodeAt(index);
+    }
+    return new Blob([buffer], { type: mimeType });
+  };
+
+  const openQueueDb = () => new Promise((resolve, reject) => {
+    const request = indexedDB.open(QUEUE_DB_NAME, QUEUE_DB_VERSION);
+
+    request.onupgradeneeded = (event) => {
+      const db = event.target.result;
+      if (!db.objectStoreNames.contains(QUEUE_STORE_NAME)) {
+        const store = db.createObjectStore(QUEUE_STORE_NAME, { keyPath: 'id' });
+        store.createIndex('createdAt', 'createdAt', { unique: false });
+        store.createIndex('stage', 'stage', { unique: false });
+      }
+    };
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('打开本地缓存失败'));
+  });
+
+  const withStore = async (mode, handler) => {
+    const db = await openQueueDb();
+    try {
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction(QUEUE_STORE_NAME, mode);
+        const store = tx.objectStore(QUEUE_STORE_NAME);
+        let settled = false;
+        const safeResolve = (value) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          resolve(value);
+        };
+        const safeReject = (error) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          reject(error);
+        };
+
+        tx.oncomplete = () => safeResolve(undefined);
+        tx.onerror = () => safeReject(tx.error || new Error('本地缓存事务失败'));
+        tx.onabort = () => safeReject(tx.error || new Error('本地缓存事务终止'));
+
+        try {
+          handler(store, tx, safeResolve, safeReject);
+        } catch (error) {
+          safeReject(error);
+        }
+      });
+    } finally {
+      db.close();
+    }
+  };
+
+  const putQueueItem = (item) => withStore('readwrite', (store) => {
+    store.put(item);
+  });
+
+  const getQueueItem = (id) => withStore('readonly', (store, tx, resolve) => {
+    const request = store.get(id);
+    request.onsuccess = () => resolve(request.result || null);
+  });
+
+  const getAllQueueItems = () => withStore('readonly', (store, tx, resolve) => {
+    const request = store.getAll();
+    request.onsuccess = () => resolve(Array.isArray(request.result) ? request.result : []);
+  });
+
+  const deleteQueueItem = (id) => withStore('readwrite', (store) => {
+    store.delete(id);
+  });
+
+  const updateQueueItem = async (id, patch) => {
+    const item = await getQueueItem(id);
+    if (!item) {
+      return null;
+    }
+    const next = {
+      ...item,
+      ...patch,
+      updatedAt: Date.now(),
+    };
+    await putQueueItem(next);
+    return next;
+  };
+
+  const ensureQueueItem = (raw) => ({
+    attempts: 0,
+    stage: 'queued',
+    recognizedCandidates: [],
+    recognizedTextLines: [],
+    recognizedOrderNo: '',
+    initResponse: null,
+    pickupLogId: null,
+    ...raw,
+  });
+
+  const drawImageFromBlob = (blob) => new Promise((resolve, reject) => {
+    const image = new Image();
+    const objectUrl = URL.createObjectURL(blob);
+    image.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      resolve(image);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error('图片解码失败'));
+    };
+    image.src = objectUrl;
+  });
+
+  const renderDataUrlToCanvas = async (dataUrl) => {
+    const blob = toBlobFromDataUrl(dataUrl);
+    const image = await drawImageFromBlob(blob);
+    const canvas = document.createElement('canvas');
+    canvas.width = image.width;
+    canvas.height = image.height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      throw new Error('无法创建画布');
+    }
+    ctx.drawImage(image, 0, 0);
+    return { canvas, ctx };
+  };
+
+  const getCanvasBlob = (canvas, mimeType, quality) => new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        reject(new Error('图片压缩失败'));
+        return;
+      }
+      resolve(blob);
+    }, mimeType, quality);
+  });
+
+  const compressImageDataUrl = async (sourceDataUrl, targetBytes = 2048) => {
+    const { canvas } = await renderDataUrlToCanvas(sourceDataUrl);
+    const maxSide = Math.max(canvas.width, canvas.height);
+    const scale = maxSide > 900 ? 900 / maxSide : 1;
+
+    let workingCanvas = document.createElement('canvas');
+    workingCanvas.width = Math.max(1, Math.round(canvas.width * scale));
+    workingCanvas.height = Math.max(1, Math.round(canvas.height * scale));
+
+    let workingCtx = workingCanvas.getContext('2d');
+    if (!workingCtx) {
+      throw new Error('无法创建输出画布');
+    }
+    workingCtx.drawImage(canvas, 0, 0, workingCanvas.width, workingCanvas.height);
+
+    let quality = 0.68;
+    let blob = await getCanvasBlob(workingCanvas, 'image/jpeg', quality);
+
+    for (let round = 0; round < 14 && blob.size > targetBytes; round += 1) {
+      quality = Math.max(0.04, quality * 0.82);
+      blob = await getCanvasBlob(workingCanvas, 'image/jpeg', quality);
+      if (blob.size <= targetBytes) {
+        break;
+      }
+
+      if (round % 4 === 3 && Math.min(workingCanvas.width, workingCanvas.height) > 120) {
+        const resizedCanvas = document.createElement('canvas');
+        resizedCanvas.width = Math.max(120, Math.round(workingCanvas.width * 0.86));
+        resizedCanvas.height = Math.max(120, Math.round(workingCanvas.height * 0.86));
+        const resizedCtx = resizedCanvas.getContext('2d');
+        if (!resizedCtx) {
+          break;
+        }
+        resizedCtx.drawImage(workingCanvas, 0, 0, resizedCanvas.width, resizedCanvas.height);
+        workingCanvas = resizedCanvas;
+        workingCtx = workingCanvas.getContext('2d');
+        if (!workingCtx) {
+          break;
+        }
+        blob = await getCanvasBlob(workingCanvas, 'image/jpeg', quality);
+      }
+    }
+
+    if (blob.size > targetBytes) {
+      const tinyCanvas = document.createElement('canvas');
+      tinyCanvas.width = 56;
+      tinyCanvas.height = 56;
+      const tinyCtx = tinyCanvas.getContext('2d');
+      if (!tinyCtx) {
+        throw new Error('无法压缩缩略图');
+      }
+      tinyCtx.fillStyle = '#f3f3f3';
+      tinyCtx.fillRect(0, 0, 56, 56);
+      tinyCtx.drawImage(workingCanvas, 0, 0, 56, 56);
+      blob = await getCanvasBlob(tinyCanvas, 'image/jpeg', 0.28);
+    }
+
+    const buffer = await blob.arrayBuffer();
+    return arrayBufferToDataUrl(buffer, 'image/jpeg');
+  };
+
+  const tokenizeCandidates = (rawText) => {
+    const cleaned = String(rawText || '').toUpperCase().replace(/[^A-Z0-9\n]/g, ' ');
+    const map = {
+      O: '0', D: '0', Q: '0', I: '1', L: '1', Z: '2', S: '5', B: '8',
+    };
+    const candidates = new Set();
+
+    const parts = cleaned.split(/\s+/).filter((part) => part.length >= 8);
+    parts.forEach((part) => {
+      const base = part.replace(/[^A-Z0-9]/g, '');
+      if (!base || base.length < 8) {
+        return;
+      }
+      const mapped = base.split('').map((char) => map[char] || char).join('');
+      [base, mapped].forEach((value) => {
+        const digits = value.replace(/\D/g, '');
+        if (value.length >= 8 && digits.length >= 6) {
+          candidates.add(value);
+        }
+      });
+    });
+
+    return Array.from(candidates).sort((left, right) => right.length - left.length || left.localeCompare(right));
+  };
+
+  const scanBarcodesLocally = async (imageBlob) => {
+    if (!(window.BarcodeDetector && typeof window.BarcodeDetector === 'function')) {
+      return [];
+    }
+
+    try {
+      const preferredFormats = [
+        'code_128',
+        'code_39',
+        'ean_13',
+        'ean_8',
+        'upc_a',
+        'upc_e',
+        'itf',
+        'codabar',
+      ];
+
+      let detector;
+      if (typeof window.BarcodeDetector.getSupportedFormats === 'function') {
+        const supported = await window.BarcodeDetector.getSupportedFormats();
+        const formats = preferredFormats.filter((item) => supported.includes(item));
+        detector = formats.length > 0
+          ? new window.BarcodeDetector({ formats })
+          : new window.BarcodeDetector();
+      } else {
+        detector = new window.BarcodeDetector();
+      }
+
+      const bitmap = await createImageBitmap(imageBlob);
+      try {
+        const rows = await detector.detect(bitmap);
+        const values = rows
+          .map((row) => String(row.rawValue || '').trim())
+          .filter((row) => row.length > 0);
+        return Array.from(new Set(values));
+      } finally {
+        if (typeof bitmap.close === 'function') {
+          bitmap.close();
+        }
+      }
+    } catch (error) {
+      console.error(error);
+      return [];
+    }
+  };
+
+  const localRecognizeOrderNumbers = async (originalDataUrl) => {
+    const imageBlob = toBlobFromDataUrl(originalDataUrl);
+    const lines = await scanBarcodesLocally(imageBlob);
+    const candidates = tokenizeCandidates(lines.join('\n'));
+    return { lines, candidates };
+  };
+
+  const makeQueueCardHtml = (item) => {
+    const stageLabel = stageLabels[item.stage] || item.stage;
+    const orderNo = item.recognizedOrderNo ? `，单号 ${escapeHtml(item.recognizedOrderNo)}` : '';
+    const errorText = item.lastError ? `<span class="queue-error">${escapeHtml(item.lastError)}</span>` : '';
+    return `
+      <li class="queue-item queue-${escapeHtml(item.stage || 'queued')}">
+        <strong>${escapeHtml(new Date(item.createdAt || Date.now()).toLocaleTimeString())}</strong>
+        <span>${escapeHtml(stageLabel)}${orderNo}</span>
+        ${errorText}
+      </li>
+    `;
+  };
+
+  const renderQueue = async () => {
+    const statusEl = document.getElementById('capture-queue-status');
+    const listEl = document.getElementById('capture-queue-list');
+    if (!statusEl || !listEl) {
+      return;
+    }
+
+    const rows = (await getAllQueueItems()).sort((left, right) => Number(right.createdAt || 0) - Number(left.createdAt || 0));
+    statusEl.textContent = `本地缓存队列：${rows.length} 张`;
+    if (rows.length === 0) {
+      listEl.innerHTML = '<li class="queue-item queue-empty">暂无任务</li>';
+      return;
+    }
+    listEl.innerHTML = rows.slice(0, 8).map((item) => makeQueueCardHtml(ensureQueueItem(item))).join('');
+  };
+
+  const safeFetchJson = async (url, options) => {
+    const response = await fetch(url, options);
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      payload = null;
+    }
+    if (!response.ok) {
+      const message = (payload && payload.error) ? payload.error : `请求失败(${response.status})`;
+      throw new Error(message);
+    }
+    return payload || {};
+  };
+
+  let queueWorkerActive = false;
+  const processQueue = async (initUrl, finalizeUrl) => {
+    if (queueWorkerActive) {
+      return;
+    }
+    queueWorkerActive = true;
+
+    try {
+      while (true) {
+        const allItems = (await getAllQueueItems())
+          .map((item) => ensureQueueItem(item))
+          .sort((left, right) => Number(left.createdAt || 0) - Number(right.createdAt || 0));
+
+        const pending = allItems.find((item) => item.stage !== 'completed');
+        if (!pending) {
+          break;
+        }
+
+        const nextAttempts = Number(pending.attempts || 0) + 1;
+        await updateQueueItem(pending.id, { attempts: nextAttempts, lastError: '' });
+
+        try {
+          let current = ensureQueueItem((await getQueueItem(pending.id)) || pending);
+
+          if (current.stage === 'queued' || current.stage === 'failed') {
+            await updateQueueItem(current.id, { stage: 'preparing' });
+            current = ensureQueueItem((await getQueueItem(current.id)) || current);
+
+            const localResult = await localRecognizeOrderNumbers(current.originalDataUrl);
+            const recognizedCandidates = Array.isArray(localResult.candidates) ? localResult.candidates : [];
+            const recognizedTextLines = Array.isArray(localResult.lines) ? localResult.lines : [];
+            const recognizedOrderNo = recognizedCandidates[0] || '';
+            const thumbnailDataUrl = await compressImageDataUrl(current.originalDataUrl, 2048);
+
+            await updateQueueItem(current.id, {
+              stage: 'initUploading',
+              thumbnailDataUrl,
+              recognizedCandidates,
+              recognizedTextLines,
+              recognizedOrderNo,
+            });
+            current = ensureQueueItem((await getQueueItem(current.id)) || current);
+
+            const initPayload = await safeFetchJson(initUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              credentials: 'same-origin',
+              body: JSON.stringify({
+                thumbnail_data_url: current.thumbnailDataUrl,
+                recognized_order_no: current.recognizedOrderNo,
+                recognized_candidates: current.recognizedCandidates,
+                recognized_text_lines: current.recognizedTextLines,
+              }),
+            });
+
+            await updateQueueItem(current.id, {
+              stage: 'initDone',
+              initResponse: initPayload,
+              pickupLogId: Number(initPayload.pickup_log_id || 0) || null,
+              recognizedOrderNo: current.recognizedOrderNo || String(initPayload.recognized_order_no || ''),
+            });
+            current = ensureQueueItem((await getQueueItem(current.id)) || current);
+          }
+
+          if (current.stage === 'initDone' || current.stage === 'originalUploading') {
+            await updateQueueItem(current.id, { stage: 'originalUploading' });
+            current = ensureQueueItem((await getQueueItem(current.id)) || current);
+
+            if (!current.pickupLogId) {
+              throw new Error('缺少日志编号，无法补传原图');
+            }
+
+            const originalBlob = toBlobFromDataUrl(current.originalDataUrl);
+            const formData = new FormData();
+            formData.append('pickup_log_id', String(current.pickupLogId));
+            formData.append('pickup_image', originalBlob, current.originalName || `capture_${current.id}.jpg`);
+
+            await safeFetchJson(finalizeUrl, {
+              method: 'POST',
+              credentials: 'same-origin',
+              body: formData,
+            });
+
+            await updateQueueItem(current.id, { stage: 'completed', lastError: '' });
+            await sleep(1200);
+            await deleteQueueItem(current.id);
+          }
+        } catch (error) {
+          await updateQueueItem(pending.id, {
+            stage: 'failed',
+            lastError: error && error.message ? String(error.message) : '上传失败',
+          });
+          await sleep(Math.min(15000, 1200 * nextAttempts));
+        }
+
+        await renderQueue();
+      }
+    } finally {
+      queueWorkerActive = false;
+      await renderQueue();
+    }
+  };
 
   const flashes = document.querySelectorAll('.flash');
   if (flashes.length > 0) {
@@ -21,7 +490,62 @@
   const pickupInput = document.getElementById('pickup-image-input');
   const cameraForm = document.getElementById('camera-form');
 
-  if (cameraButton && pickupInput && cameraForm) {
+  if (cameraButton && pickupInput && cameraForm && 'indexedDB' in window) {
+    const stagedInitUrl = cameraForm.dataset.stagedInitUrl || '';
+    const stagedFinalizeUrl = cameraForm.dataset.stagedFinalizeUrl || '';
+
+    cameraButton.addEventListener('click', () => {
+      pickupInput.click();
+    });
+
+    const queueIncomingFiles = async (files) => {
+      const now = Date.now();
+      for (let index = 0; index < files.length; index += 1) {
+        const file = files[index];
+        if (!file) {
+          continue;
+        }
+        const fileBuffer = await fileToArrayBuffer(file);
+        const originalDataUrl = arrayBufferToDataUrl(fileBuffer, file.type || 'image/jpeg');
+        const item = ensureQueueItem({
+          id: `${now}-${index}-${Math.random().toString(36).slice(2, 8)}`,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          stage: 'queued',
+          originalName: file.name || `capture_${now}.jpg`,
+          originalType: file.type || 'image/jpeg',
+          originalDataUrl,
+          size: file.size || 0,
+        });
+        await putQueueItem(item);
+      }
+
+      await renderQueue();
+      if (stagedInitUrl && stagedFinalizeUrl) {
+        processQueue(stagedInitUrl, stagedFinalizeUrl);
+      }
+    };
+
+    pickupInput.addEventListener('change', async () => {
+      if (pickupInput.files && pickupInput.files.length > 0) {
+        cameraButton.disabled = true;
+        try {
+          await queueIncomingFiles(Array.from(pickupInput.files));
+        } catch (error) {
+          console.error(error);
+        } finally {
+          pickupInput.value = '';
+          cameraButton.disabled = false;
+        }
+      }
+    });
+
+    renderQueue().then(() => {
+      if (stagedInitUrl && stagedFinalizeUrl) {
+        processQueue(stagedInitUrl, stagedFinalizeUrl);
+      }
+    });
+  } else if (cameraButton && pickupInput && cameraForm) {
     cameraButton.addEventListener('click', () => {
       pickupInput.click();
     });
@@ -39,10 +563,16 @@
   let messageList = document.querySelector('.message-bar .msg-list');
   if (pollAnchor) {
     const pollUrl = pollAnchor.dataset.pollUrl || '';
+    const isBandwidthSaver = pollAnchor.dataset.bandwidthSaver === '1';
     let latestId = Number(pollAnchor.dataset.initialId || '0');
 
     const refreshNotifyButton = () => {
       if (!notifyButton) {
+        return;
+      }
+      if (isBandwidthSaver) {
+        notifyButton.textContent = '省流模式已开启（自动通知轮询已关闭）';
+        notifyButton.disabled = true;
         return;
       }
       if (!('Notification' in window)) {
@@ -62,7 +592,7 @@
       }
     };
 
-    if (notifyButton && 'Notification' in window) {
+    if (!isBandwidthSaver && notifyButton && 'Notification' in window) {
       notifyButton.addEventListener('click', async () => {
         try {
           const permission = await Notification.requestPermission();
@@ -134,7 +664,9 @@
       }
     };
 
-    setInterval(pollNotifications, 15000);
+    if (!isBandwidthSaver) {
+      setInterval(pollNotifications, 15000);
+    }
   }
 
   const searchInput = document.getElementById('order-search-input');

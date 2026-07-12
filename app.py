@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import datetime as dt
 import hmac
 import os
@@ -49,14 +51,24 @@ SQLITE_HEADER = b"SQLite format 3\x00"
 PORT = int(os.getenv("PORT", "5000"))
 MAX_CONTENT_LENGTH_BYTES = 300 * 1024 * 1024
 
-UI_BUILD_ID = "20260711_200500_94731"
-UI_CSS_FILE = f"ui_{UI_BUILD_ID}.css"
-UI_JS_FILE = f"ui_{UI_BUILD_ID}.js"
+UI_BUILD_ID = "20260712_060000_cache3m"
+UI_CSS_FILE = "ui_20260711_200500_94731.css"
+UI_JS_FILE = "ui_20260711_200500_94731.js"
+SW_JS_FILE = "sw_20260712_050000_localcache.js"
 
 DEFAULT_REMINDER_MESSAGE = "您的快递到了"
 ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 LOOPBACK_ADDRESSES = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
 ORDER_TOKEN_PATTERN = re.compile(r"[A-Z0-9]{8,32}")
+THUMBNAIL_MIME_SUFFIXES = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
+MAX_THUMBNAIL_BYTES = 120 * 1024
+LOCAL_STATIC_RETENTION_SECONDS = 90 * 24 * 60 * 60
+BANDWIDTH_SAVER_MODE = True
 
 OCR_CONFUSION_MAP = {
     "O": "0",
@@ -539,6 +551,197 @@ def create_db_backup() -> Path | None:
     return backup_path
 
 
+def build_unique_upload_filename(original_filename: str, prefix: str = "") -> str:
+    safe_original = secure_filename(clean_text(original_filename)) or "upload.jpg"
+    suffix = Path(safe_original).suffix.lower()
+    if suffix not in ALLOWED_IMAGE_SUFFIXES:
+        safe_original = "upload.jpg"
+
+    return (
+        f"{prefix}{dt.datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}_"
+        f"{safe_original}"
+    )
+
+
+def save_thumbnail_data_url(data_url: str) -> str:
+    matched = re.match(
+        r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.+)$",
+        clean_text(data_url),
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not matched:
+        raise ValueError("缩略图格式错误。")
+
+    mime_type = matched.group(1).lower()
+    encoded = re.sub(r"\s+", "", matched.group(2))
+    suffix = THUMBNAIL_MIME_SUFFIXES.get(mime_type)
+    if not suffix:
+        raise ValueError("缩略图类型不支持。")
+
+    try:
+        image_bytes = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("缩略图解码失败。") from exc
+
+    if not image_bytes:
+        raise ValueError("缩略图内容为空。")
+    if len(image_bytes) > MAX_THUMBNAIL_BYTES:
+        raise ValueError("缩略图过大，请压缩后重试。")
+
+    unique_filename = build_unique_upload_filename(f"thumb{suffix}", prefix="thumb_")
+    image_path = UPLOAD_DIR / unique_filename
+    with open(image_path, "wb") as file_obj:
+        file_obj.write(image_bytes)
+    return unique_filename
+
+
+def sanitize_client_candidates(raw_candidates: object, fallback_candidate: object = "") -> list[str]:
+    recognized_parts: list[str] = []
+
+    if isinstance(raw_candidates, (list, tuple)):
+        for item in raw_candidates[:30]:
+            text = clean_text(item)
+            if text:
+                recognized_parts.append(text[:120])
+    else:
+        text = clean_text(raw_candidates)
+        if text:
+            recognized_parts.append(text[:120])
+
+    fallback_text = clean_text(fallback_candidate)
+    if fallback_text:
+        recognized_parts.append(fallback_text[:120])
+
+    return extract_order_candidates(recognized_parts)
+
+
+def build_local_extracted_text(local_lines: object, candidates: list[str]) -> str:
+    merged_lines: list[str] = []
+
+    if isinstance(local_lines, (list, tuple)):
+        for row in local_lines[:80]:
+            text = clean_text(row)
+            if text:
+                merged_lines.append(text[:240])
+
+    for candidate in candidates:
+        if candidate not in merged_lines:
+            merged_lines.append(candidate)
+
+    return "\n".join(merge_unique_lines(merged_lines))
+
+
+def create_notifications_for_candidates(
+    db_session,
+    pickup_log: PickupLog,
+    uploader_name: str,
+    candidates: list[str],
+) -> tuple[int, int]:
+    reminder_rules = db_session.scalars(
+        select(ReminderRule)
+        .where(ReminderRule.is_active.is_(True))
+        .order_by(ReminderRule.created_at.asc())
+    ).all()
+
+    watcher_names = sorted({rule.watcher_name for rule in reminder_rules if clean_text(rule.watcher_name)})
+    watcher_rows = []
+    if watcher_names:
+        watcher_rows = db_session.execute(
+            select(User.id, User.username).where(User.username.in_(watcher_names))
+        ).all()
+
+    watcher_id_by_name = {str(row[1]): int(row[0]) for row in watcher_rows}
+    watcher_ids = [int(row[0]) for row in watcher_rows]
+
+    creator_groups_map: dict[int, set[int]] = {}
+    if watcher_ids:
+        creator_group_rows = db_session.execute(
+            select(GroupMember.user_id, GroupMember.group_id).where(GroupMember.user_id.in_(watcher_ids))
+        ).all()
+        for row in creator_group_rows:
+            creator_groups_map.setdefault(int(row[0]), set()).add(int(row[1]))
+
+    all_group_ids = sorted({group_id for groups in creator_groups_map.values() for group_id in groups})
+    group_name_map: dict[int, str] = {}
+    group_recipient_map: dict[int, list[str]] = {}
+    if all_group_ids:
+        group_name_rows = db_session.execute(
+            select(UserGroup.id, UserGroup.name).where(UserGroup.id.in_(all_group_ids))
+        ).all()
+        group_name_map = {int(row[0]): str(row[1]) for row in group_name_rows}
+
+        recipient_rows = db_session.execute(
+            select(GroupMember.group_id, User.username, GroupMember.receive_notifications)
+            .join(User, User.id == GroupMember.user_id)
+            .where(GroupMember.group_id.in_(all_group_ids))
+            .order_by(GroupMember.group_id.asc(), User.username.asc())
+        ).all()
+        for row in recipient_rows:
+            if not bool(row[2]):
+                continue
+            group_recipient_map.setdefault(int(row[0]), []).append(str(row[1]))
+
+    matched_rules = 0
+    notification_count = 0
+
+    for rule in reminder_rules:
+        matched_candidate = next((candidate for candidate in candidates if suffix_matches(candidate, rule.order_suffix)), None)
+        if not matched_candidate:
+            continue
+
+        matched_rules += 1
+        recipients = {rule.watcher_name}
+        scope_text = "个人提醒"
+        creator_group_names: list[str] = []
+
+        creator_id = watcher_id_by_name.get(rule.watcher_name)
+        if creator_id is not None:
+            for group_id in sorted(creator_groups_map.get(creator_id, set())):
+                members = group_recipient_map.get(group_id, [])
+                if not members:
+                    continue
+                recipients.update(members)
+                creator_group_names.append(group_name_map.get(group_id, f"组#{group_id}"))
+
+        if creator_group_names:
+            scope_text = f"个人 + 分组: {'、'.join(creator_group_names)}"
+
+        if not recipients:
+            continue
+
+        item_name = clean_text(getattr(rule, "item_name", ""))
+        custom_message = clean_text(rule.custom_message) or DEFAULT_REMINDER_MESSAGE
+        headline = f"{item_name} 到了" if item_name else (custom_message or "快递到了")
+
+        for recipient in sorted(recipients):
+            title = headline
+            body = (
+                f"{headline}\n"
+                f"提醒创建人: {rule.watcher_name}\n"
+                f"拍照人: {uploader_name}\n"
+                f"命中尾号: {rule.order_suffix}\n"
+                f"识别单号: {matched_candidate}\n"
+                f"通知范围: {scope_text}"
+            )
+            db_session.add(
+                Notification(
+                    reminder_id=rule.id,
+                    pickup_log_id=pickup_log.id,
+                    watcher_name=recipient,
+                    title=title,
+                    body=body,
+                    matched_order_no=matched_candidate,
+                    order_suffix=rule.order_suffix,
+                    uploader_name=uploader_name,
+                    image_filename=pickup_log.image_filename,
+                    is_read=False,
+                )
+            )
+            notification_count += 1
+
+    return matched_rules, notification_count
+
+
 def login_required(view_func):
     @wraps(view_func)
     def wrapped(*args, **kwargs):
@@ -624,9 +827,40 @@ def inject_template_context() -> dict[str, object]:
         "ui_build_id": UI_BUILD_ID,
         "ui_css_file": UI_CSS_FILE,
         "ui_js_file": UI_JS_FILE,
+        "bandwidth_saver_mode": BANDWIDTH_SAVER_MODE,
         "is_super_admin": is_loopback_request() if request else False,
         "current_user": getattr(g, "current_user", None),
     }
+
+
+@app.after_request
+def apply_cache_headers(response):
+    if request.method != "GET":
+        return response
+
+    path = clean_text(request.path)
+
+    if path == "/sw.js":
+        response.headers["Cache-Control"] = "no-cache"
+        response.headers["Service-Worker-Allowed"] = "/"
+        return response
+
+    if path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    if path.startswith("/static/") or path.startswith("/uploads/"):
+        response.headers["Cache-Control"] = (
+            f"private, max-age={LOCAL_STATIC_RETENTION_SECONDS}, immutable"
+        )
+        return response
+
+    if response.status_code == 200 and clean_text(response.mimetype).startswith("text/html"):
+        response.headers["Cache-Control"] = (
+            f"private, max-age={LOCAL_STATIC_RETENTION_SECONDS}"
+        )
+
+    return response
 
 
 @app.route("/register", methods=["GET", "POST"])
@@ -790,10 +1024,7 @@ def scan_and_record():
         flash("图片格式不支持，请上传 JPG/PNG/WEBP/BMP/TIF。", "danger")
         return redirect(url_for("index"))
 
-    unique_filename = (
-        f"{dt.datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}_"
-        f"{secure_filename(uploaded.filename)}"
-    )
+    unique_filename = build_unique_upload_filename(uploaded.filename)
     image_path = UPLOAD_DIR / unique_filename
     uploaded.save(image_path)
 
@@ -813,108 +1044,12 @@ def scan_and_record():
     )
     g.db.add(pickup_log)
     g.db.flush()
-
-    reminder_rules = g.db.scalars(
-        select(ReminderRule)
-        .where(ReminderRule.is_active.is_(True))
-        .order_by(ReminderRule.created_at.asc())
-    ).all()
-
-    watcher_names = sorted({rule.watcher_name for rule in reminder_rules if clean_text(rule.watcher_name)})
-    watcher_rows = []
-    if watcher_names:
-        watcher_rows = g.db.execute(
-            select(User.id, User.username).where(User.username.in_(watcher_names))
-        ).all()
-
-    watcher_id_by_name = {str(row[1]): int(row[0]) for row in watcher_rows}
-    watcher_ids = [int(row[0]) for row in watcher_rows]
-
-    creator_groups_map: dict[int, set[int]] = {}
-    if watcher_ids:
-        creator_group_rows = g.db.execute(
-            select(GroupMember.user_id, GroupMember.group_id).where(GroupMember.user_id.in_(watcher_ids))
-        ).all()
-        for row in creator_group_rows:
-            creator_groups_map.setdefault(int(row[0]), set()).add(int(row[1]))
-
-    all_group_ids = sorted({group_id for groups in creator_groups_map.values() for group_id in groups})
-    group_name_map: dict[int, str] = {}
-    group_recipient_map: dict[int, list[str]] = {}
-    if all_group_ids:
-        group_name_rows = g.db.execute(
-            select(UserGroup.id, UserGroup.name).where(UserGroup.id.in_(all_group_ids))
-        ).all()
-        group_name_map = {int(row[0]): str(row[1]) for row in group_name_rows}
-
-        recipient_rows = g.db.execute(
-            select(GroupMember.group_id, User.username, GroupMember.receive_notifications)
-            .join(User, User.id == GroupMember.user_id)
-            .where(GroupMember.group_id.in_(all_group_ids))
-            .order_by(GroupMember.group_id.asc(), User.username.asc())
-        ).all()
-        for row in recipient_rows:
-            if not bool(row[2]):
-                continue
-            group_recipient_map.setdefault(int(row[0]), []).append(str(row[1]))
-
-    matched_rules = 0
-    notification_count = 0
-
-    for rule in reminder_rules:
-        matched_candidate = next((candidate for candidate in candidates if suffix_matches(candidate, rule.order_suffix)), None)
-        if not matched_candidate:
-            continue
-
-        matched_rules += 1
-        recipients = {rule.watcher_name}
-        scope_text = "个人提醒"
-        creator_group_names: list[str] = []
-
-        creator_id = watcher_id_by_name.get(rule.watcher_name)
-        if creator_id is not None:
-            for group_id in sorted(creator_groups_map.get(creator_id, set())):
-                members = group_recipient_map.get(group_id, [])
-                if not members:
-                    continue
-                recipients.update(members)
-                creator_group_names.append(group_name_map.get(group_id, f"组#{group_id}"))
-
-        if creator_group_names:
-            scope_text = f"个人 + 分组: {'、'.join(creator_group_names)}"
-
-        if not recipients:
-            continue
-
-        item_name = clean_text(getattr(rule, "item_name", ""))
-        custom_message = clean_text(rule.custom_message) or DEFAULT_REMINDER_MESSAGE
-        headline = f"{item_name} 到了" if item_name else (custom_message or "快递到了")
-
-        for recipient in sorted(recipients):
-            title = headline
-            body = (
-                f"{headline}\n"
-                f"提醒创建人: {rule.watcher_name}\n"
-                f"拍照人: {uploader_name}\n"
-                f"命中尾号: {rule.order_suffix}\n"
-                f"识别单号: {matched_candidate}\n"
-                f"通知范围: {scope_text}"
-            )
-            g.db.add(
-                Notification(
-                    reminder_id=rule.id,
-                    pickup_log_id=pickup_log.id,
-                    watcher_name=recipient,
-                    title=title,
-                    body=body,
-                    matched_order_no=matched_candidate,
-                    order_suffix=rule.order_suffix,
-                    uploader_name=uploader_name,
-                    image_filename=unique_filename,
-                    is_read=False,
-                )
-            )
-            notification_count += 1
+    matched_rules, notification_count = create_notifications_for_candidates(
+        g.db,
+        pickup_log,
+        uploader_name,
+        candidates,
+    )
 
     g.db.commit()
 
@@ -927,6 +1062,148 @@ def scan_and_record():
         "success",
     )
     return redirect(url_for("index"))
+
+
+@app.post("/api/scan/staged/init")
+@login_required
+def staged_scan_init():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "error": "请求格式错误。"}), 400
+
+    thumbnail_data_url = clean_text(payload.get("thumbnail_data_url"))
+    if not thumbnail_data_url:
+        return jsonify({"ok": False, "error": "缺少缩略图。"}), 400
+
+    try:
+        thumbnail_filename = save_thumbnail_data_url(thumbnail_data_url)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    candidates = sanitize_client_candidates(
+        payload.get("recognized_candidates"),
+        payload.get("recognized_order_no"),
+    )
+    extracted_text = build_local_extracted_text(payload.get("recognized_text_lines"), candidates)
+    uploader_name = g.current_user.username
+
+    try:
+        pickup_log = PickupLog(
+            uploader_name=uploader_name,
+            image_filename=thumbnail_filename,
+            extracted_text=extracted_text,
+            recognized_order_no=(candidates[0] if candidates else ""),
+        )
+        g.db.add(pickup_log)
+        g.db.flush()
+
+        matched_rules, notification_count = create_notifications_for_candidates(
+            g.db,
+            pickup_log,
+            uploader_name,
+            candidates,
+        )
+        g.db.commit()
+    except Exception:
+        g.db.rollback()
+        (UPLOAD_DIR / thumbnail_filename).unlink(missing_ok=True)
+        return jsonify({"ok": False, "error": "初始化上传失败，请稍后重试。"}), 500
+
+    return jsonify(
+        {
+            "ok": True,
+            "pickup_log_id": int(pickup_log.id),
+            "recognized_order_no": pickup_log.recognized_order_no,
+            "candidate_count": len(candidates),
+            "matched_rules": matched_rules,
+            "notifications_created": notification_count,
+        }
+    )
+
+
+@app.post("/api/scan/staged/finalize")
+@login_required
+def staged_scan_finalize():
+    pickup_log_id_raw = clean_text(request.form.get("pickup_log_id"))
+    if not pickup_log_id_raw:
+        return jsonify({"ok": False, "error": "缺少日志 ID。"}), 400
+
+    try:
+        pickup_log_id = int(pickup_log_id_raw)
+    except ValueError:
+        return jsonify({"ok": False, "error": "日志 ID 无效。"}), 400
+
+    pickup_log = g.db.get(PickupLog, pickup_log_id)
+    if pickup_log is None or pickup_log.uploader_name != g.current_user.username:
+        return jsonify({"ok": False, "error": "日志不存在或无权操作。"}), 404
+
+    uploaded = request.files.get("pickup_image")
+    if not uploaded or not uploaded.filename:
+        return jsonify({"ok": False, "error": "请上传原图文件。"}), 400
+
+    suffix = Path(uploaded.filename).suffix.lower()
+    if suffix not in ALLOWED_IMAGE_SUFFIXES:
+        return jsonify({"ok": False, "error": "图片格式不支持。"}), 400
+
+    unique_filename = build_unique_upload_filename(uploaded.filename, prefix="full_")
+    image_path = UPLOAD_DIR / unique_filename
+    old_filename = clean_text(pickup_log.image_filename)
+
+    try:
+        uploaded.save(image_path)
+        pickup_log.image_filename = unique_filename
+        notification_rows = g.db.scalars(
+            select(Notification).where(Notification.pickup_log_id == pickup_log.id)
+        ).all()
+        for row in notification_rows:
+            row.image_filename = unique_filename
+
+        # Fallback to server OCR only when local-first stage did not yield enough signal.
+        need_fallback_scan = (not notification_rows) or (not clean_text(pickup_log.recognized_order_no))
+        fallback_candidates: list[str] = []
+        fallback_extracted_text = ""
+        matched_rules = 0
+        notification_count = 0
+
+        if need_fallback_scan:
+            try:
+                fallback_candidates, _, _, fallback_extracted_text = analyze_pickup_image(image_path)
+            except Exception:
+                fallback_candidates = []
+                fallback_extracted_text = ""
+
+            if fallback_extracted_text and not clean_text(pickup_log.extracted_text):
+                pickup_log.extracted_text = fallback_extracted_text
+
+            if fallback_candidates and not clean_text(pickup_log.recognized_order_no):
+                pickup_log.recognized_order_no = fallback_candidates[0]
+
+            if fallback_candidates and not notification_rows:
+                matched_rules, notification_count = create_notifications_for_candidates(
+                    g.db,
+                    pickup_log,
+                    pickup_log.uploader_name,
+                    fallback_candidates,
+                )
+
+        g.db.commit()
+    except Exception:
+        g.db.rollback()
+        image_path.unlink(missing_ok=True)
+        return jsonify({"ok": False, "error": "原图上传失败，请稍后重试。"}), 500
+
+    if old_filename.startswith("thumb_"):
+        (UPLOAD_DIR / old_filename).unlink(missing_ok=True)
+
+    return jsonify(
+        {
+            "ok": True,
+            "pickup_log_id": int(pickup_log.id),
+            "image_filename": unique_filename,
+            "fallback_matched_rules": matched_rules,
+            "fallback_notifications_created": notification_count,
+        }
+    )
 
 
 @app.get("/settings")
@@ -1199,6 +1476,18 @@ def api_search_orders():
 @login_required
 def uploaded_file(filename: str):
     return send_from_directory(UPLOAD_DIR, filename)
+
+
+@app.get("/sw.js")
+def service_worker_script():
+    response = send_from_directory(
+        app.static_folder,
+        SW_JS_FILE,
+        mimetype="application/javascript",
+    )
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["Service-Worker-Allowed"] = "/"
+    return response
 
 
 @app.get("/admin/")
