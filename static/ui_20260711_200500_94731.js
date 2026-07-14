@@ -445,29 +445,60 @@
       return null;
     }
 
-    const hits = [];
+    const matchedUsers = new Map();
     frontendReminderSnapshot.forEach((rule) => {
-      const matchedCandidate = candidates.find((candidate) => localSuffixMatches(candidate, rule.orderSuffix));
-      if (!matchedCandidate) {
+      const matchedCandidates = candidates
+        .map((candidate) => String(candidate || '').trim().toUpperCase())
+        .filter((candidate) => candidate.length > 0)
+        .filter((candidate) => localSuffixMatches(candidate, rule.orderSuffix));
+
+      if (matchedCandidates.length === 0) {
+        return;
+      }
+
+      const watcherName = String(rule.watcherName || '').trim();
+      if (!watcherName) {
         return;
       }
 
       const groupCandidates = rule.groupNames.length > 0 ? rule.groupNames : ['个人'];
-      groupCandidates.forEach((groupName) => {
-        hits.push({
-          watcherName: rule.watcherName,
-          groupName,
-          orderSuffix: rule.orderSuffix,
-          candidate: String(matchedCandidate || ''),
+      if (!matchedUsers.has(watcherName)) {
+        matchedUsers.set(watcherName, {
+          watcherName,
+          groups: new Set(),
+          candidates: new Set(),
         });
+      }
+
+      const row = matchedUsers.get(watcherName);
+      groupCandidates.forEach((groupName) => {
+        row.groups.add(String(groupName || '').trim() || '个人');
+      });
+      matchedCandidates.forEach((candidate) => {
+        row.candidates.add(candidate);
       });
     });
 
-    if (hits.length === 0) {
+    const userRows = Array.from(matchedUsers.values());
+    if (userRows.length === 0) {
       return null;
     }
 
-    return hits[Math.floor(Math.random() * hits.length)];
+    const pickedUser = userRows[Math.floor(Math.random() * userRows.length)];
+    const groups = Array.from(pickedUser.groups);
+    const pickedGroup = groups.length > 0
+      ? groups[Math.floor(Math.random() * groups.length)]
+      : '个人';
+    const matchedCandidateRows = Array.from(pickedUser.candidates);
+    const pickedCandidate = matchedCandidateRows.length > 0
+      ? matchedCandidateRows[Math.floor(Math.random() * matchedCandidateRows.length)]
+      : '';
+
+    return {
+      watcherName: pickedUser.watcherName,
+      groupName: pickedGroup,
+      candidate: pickedCandidate,
+    };
   };
 
   const makeQueueCardHtml = (item) => {
@@ -484,7 +515,7 @@
       ? item.localMatchHint
       : null;
     const hintText = hint && hint.watcherName
-      ? `，前端预判 ${escapeHtml(hint.groupName || '个人')} / ${escapeHtml(hint.watcherName)}`
+      ? `，${escapeHtml(hint.groupName || '个人')} / ${escapeHtml(hint.watcherName)}`
       : '';
     const errorText = item.lastError ? `<span class="queue-error">${escapeHtml(item.lastError)}</span>` : '';
     return `
